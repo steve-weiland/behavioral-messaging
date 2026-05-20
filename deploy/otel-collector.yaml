@@ -1,0 +1,109 @@
+# V2 OpenTelemetry Collector config (last touched PR 6).
+#
+# Two pipelines:
+#   traces:  OTLP/gRPC → tail_sampling → batch → OTLP/gRPC to Tempo
+#   metrics: OTLP/gRPC → batch → Prometheus exporter on :8889 (Prom scrapes)
+#
+# tail_sampling (PR 6 / OBS-150/151): three-policy stack — keep all
+# errors, keep all traces > 500 ms, keep 25% of everything else. The
+# policies OR together (a trace matching any single policy is kept).
+# Services keep head-sampling at AlwaysOn (OBS-152) so the collector
+# sees every span; tail sampling decides which whole traces ship to Tempo.
+#
+# Baseline was 5% in V2; V3 PR 9 bumped it to 25% so exemplar dots on
+# the histogram dashboard panels click-through reliably. Pure 5% drop
+# rate means most fast-bucket exemplar trace_ids resolve to "not found"
+# in Tempo. 25% retains 75% of the volume savings while making the
+# UX work — see README "Exemplars vs tail sampling".
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+  # MySQL-server metrics via OTel mysqlreceiver. Feeds the metrics
+  # pipeline → Prometheus exporter on :8889 alongside HTTP RED metrics.
+  # The receiver queries SHOW GLOBAL STATUS + information_schema; the
+  # bm user needs PROCESS + SELECT on performance_schema for the full
+  # metric set (granted in migrations).
+  mysql:
+    endpoint: mysql:3306
+    username: bm
+    password: bm
+    database: bm
+    collection_interval: 15s
+
+  # V3 PR 10: host metrics. Inside Docker on macOS this reads the
+  # Linux VM's /proc and /sys (bind-mounted at /hostfs in compose),
+  # not the macOS host. Documented on the panels.
+  # `host_metrics` is the canonical name in 0.151+ ('hostmetrics' is
+  # a deprecated alias). Filesystem scraper omitted — Docker Desktop
+  # bind-mounts confuse it with paths the VM can't read.
+  host_metrics:
+    root_path: /hostfs
+    collection_interval: 15s
+    scrapers:
+      cpu:
+      memory:
+      load:
+      disk:
+      network:
+
+processors:
+  # tail_sampling buffers spans grouped by trace_id, waits decision_wait
+  # for late spans, then applies the policies. Memory bound is num_traces.
+  tail_sampling:
+    decision_wait: 10s
+    num_traces: 50000
+    expected_new_traces_per_sec: 100
+    policies:
+      - name: keep-errors
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+      - name: keep-slow
+        type: latency
+        latency:
+          threshold_ms: 500
+      - name: baseline-25pct
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: 25
+
+  batch:
+    send_batch_size: 256
+    timeout: 1s
+
+exporters:
+  otlp_grpc/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    # Surface OTel resource attributes (service.name, etc.) as Prom labels
+    # so the dashboard can group by service.
+    resource_to_telemetry_conversion:
+      enabled: true
+    # V3 PR 9: emit OpenMetrics text format so exemplars survive the
+    # OTLP → Prom conversion. Prometheus' exemplar-storage feature
+    # only ingests exemplars from OpenMetrics, not classic Prom format.
+    enable_open_metrics: true
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      # tail_sampling FIRST so the decision is made on the full trace,
+      # then batch for export efficiency.
+      processors: [tail_sampling, batch]
+      exporters: [otlp_grpc/tempo, debug]
+    metrics:
+      receivers: [otlp, mysql, host_metrics]
+      processors: [batch]
+      exporters: [prometheus]
+  telemetry:
+    logs:
+      level: info

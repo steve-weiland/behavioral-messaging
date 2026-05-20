@@ -1,0 +1,85 @@
+// V3 PR 8 — Grafana Alloy config (Q25).
+//
+// Pipeline:
+//   discovery.docker         → enumerate running compose containers
+//   discovery.relabel        → promote container metadata to labels
+//   loki.source.docker       → tail container stdout via the Docker API
+//   loki.process             → parse the slog JSON, promote service_name + level
+//                              to labels, keep trace_id + span_id as structured
+//                              metadata so cardinality stays bounded
+//   loki.write               → push to Loki
+
+discovery.docker "containers" {
+  host             = "unix:///var/run/docker.sock"
+  refresh_interval = "10s"
+}
+
+discovery.relabel "containers" {
+  targets = discovery.docker.containers.targets
+
+  // KEEP only containers from our compose project. The Docker socket on
+  // a shared dev host exposes every container running anywhere, including
+  // unrelated projects, which would (a) leak their logs into our Loki and
+  // (b) fail Loki's max-age window on long-running ones.
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    regex         = "observability-stack"
+    action        = "keep"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "compose_service"
+  }
+}
+
+loki.source.docker "containers" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.containers.output
+  forward_to = [loki.process.parse_json.receiver]
+  refresh_interval = "10s"
+}
+
+loki.process "parse_json" {
+  forward_to = [loki.write.local.receiver]
+
+  // Stage 1: try to parse the line as JSON. Non-JSON lines (Tempo, RabbitMQ,
+  // Postgres etc.) silently fall through with no extracted fields.
+  stage.json {
+    expressions = {
+      level        = "level",
+      service_name = "\"service.name\"",
+      trace_id     = "trace_id",
+      span_id      = "span_id",
+      msg          = "msg",
+    }
+  }
+
+  // Stage 2: low-cardinality fields → Loki labels (used for index / filter).
+  stage.labels {
+    values = {
+      level        = "",
+      service_name = "",
+    }
+  }
+
+  // Stage 3: high-cardinality fields → structured metadata (per-line, not
+  // indexed). Tempo's "Trace to logs" matches against these via |= filter.
+  stage.structured_metadata {
+    values = {
+      trace_id = "",
+      span_id  = "",
+    }
+  }
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

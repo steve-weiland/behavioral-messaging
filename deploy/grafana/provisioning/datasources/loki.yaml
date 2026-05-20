@@ -1,0 +1,21 @@
+# V3 PR 8 — Grafana Loki datasource.
+apiVersion: 1
+
+datasources:
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    uid: loki
+    isDefault: false
+    editable: false
+    jsonData:
+      maxLines: 1000
+      derivedFields:
+        # Click a trace_id in the Logs panel → opens the trace in Tempo.
+        - name: trace_id
+          datasourceUid: tempo
+          matcherType: label
+          matcherRegex: trace_id
+          url: "$${__value.raw}"
+          urlDisplayLabel: "View trace"

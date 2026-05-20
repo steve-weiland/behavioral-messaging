@@ -1,0 +1,19 @@
+# Grafana Prometheus datasource (V2 PR 3; V3 PR 9 adds exemplar links).
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    uid: prometheus
+    isDefault: false
+    editable: false
+    jsonData:
+      timeInterval: 15s
+      # V3 PR 9: clicking an exemplar dot on a histogram panel jumps
+      # to the matching trace in Tempo. The exemplar label name is
+      # "trace_id" — what the OTel SDK attaches by default.
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: tempo

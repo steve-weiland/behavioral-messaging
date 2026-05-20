@@ -1,0 +1,45 @@
+# V3 PR 8 — Loki single-binary config (Q26).
+#
+# Filesystem chunk store + tsdb index. Mirrors Tempo's V2 deployment shape
+# (single binary, local disk). 7-day retention is plenty for portfolio
+# demos; production-realistic compaction is V4 if it ever happens.
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: info
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: "2024-01-01"
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  retention_period: 168h           # 7 days
+  allow_structured_metadata: true  # required for Alloy's structured_metadata stage
+
+compactor:
+  working_directory: /loki/compactor
+  retention_enabled: true
+  delete_request_store: filesystem
+
+ruler:
+  alertmanager_url: http://localhost:9093

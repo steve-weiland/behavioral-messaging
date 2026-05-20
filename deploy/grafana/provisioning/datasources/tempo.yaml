@@ -1,0 +1,24 @@
+# Grafana Tempo datasource (V1 trace store; V3 PR 8 wires Trace→Logs).
+apiVersion: 1
+
+datasources:
+  - name: Tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    uid: tempo
+    isDefault: true
+    editable: false
+    jsonData:
+      httpMethod: GET
+      # V3 PR 8: clicking a span in Tempo opens a Loki query for that span's
+      # service + trace_id. The span's resource.service.name attribute is
+      # mapped to the Loki label "service_name" Alloy promotes.
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: "-5m"
+        spanEndTimeShift: "5m"
+        filterByTraceID: true
+        tags:
+          - key: "service.name"
+            value: "service_name"

@@ -1,0 +1,225 @@
+{
+  "annotations": {"list": []},
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [
+    {
+      "title": "Resources — USE",
+      "type": "dashboards",
+      "tags": ["use"],
+      "asDropdown": false,
+      "targetBlank": false
+    }
+  ],
+  "panels": [
+    {
+      "id": 9,
+      "type": "stat",
+      "title": "Firing alerts",
+      "description": "Count of Prometheus alerts currently in the firing state. Reads the synthetic ALERTS{alertstate=\"firing\"} series. 0 = clean. Click through to http://localhost:9090/alerts for the full list and 'how long firing' detail. With no Alertmanager configured (out of V2 scope), this panel + the Prometheus /alerts page are the only places firing alerts surface.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(ALERTS{alertstate=\"firing\"}) or vector(0)",
+          "legendFormat": "firing"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"value": null, "color": "green"},
+              {"value": 1, "color": "red"}
+            ]
+          }
+        }
+      },
+      "options": {"colorMode": "background", "graphMode": "none", "textMode": "value_and_name", "reduceOptions": {"calcs": ["lastNotNull"]}},
+      "gridPos": {"h": 4, "w": 24, "x": 0, "y": 0}
+    },
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "HTTP request rate (req/s) by service",
+      "description": "RED — Rate. From otelhttp's http.server.request.duration histogram count.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (service_name) (rate(http_server_request_duration_seconds_count[1m]))",
+          "legendFormat": "{{service_name}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "reqps"}},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4}
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "HTTP error % by service (5xx)",
+      "description": "RED — Errors. Share of 5xx responses per service.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (service_name) (rate(http_server_request_duration_seconds_count{http_response_status_code=~\"5..\"}[5m])) / clamp_min(sum by (service_name) (rate(http_server_request_duration_seconds_count[5m])), 1e-12)",
+          "legendFormat": "{{service_name}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4}
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "HTTP p95 latency by service",
+      "description": "RED — Duration (p95). histogram_quantile over otelhttp histograms. V3 PR 9: exemplar dots on the timeseries deep-link to the representative trace.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (service_name, le) (rate(http_server_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{service_name}}",
+          "exemplar": true
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12}
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Messaging consume duration p95 by queue",
+      "description": "Per-queue consume p95 from amqpx's messaging.consume.duration histogram. V3 PR 9: exemplar dots deep-link to the representative trace.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (messaging_destination_name, le) (rate(messaging_consume_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{messaging_destination_name}}",
+          "exemplar": true
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12}
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Messaging consume drops/sec by queue",
+      "description": "F4 — drop rate is now visible. Increments on Outcome=NackDrop.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (messaging_destination_name) (rate(messaging_consume_dropped_total[1m]))",
+          "legendFormat": "{{messaging_destination_name}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "reqps"}},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 20}
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "DLQ depth by queue (V2 PR 4)",
+      "description": "F5 — poison messages now land in *.dlq instead of vanishing. Pulls rabbitmq_queue_messages from RabbitMQ's built-in prometheus plugin.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rabbitmq_queue_messages{queue=~\".*\\\\.dlq\"}",
+          "legendFormat": "{{queue}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 28}
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Source queue depth (backlog)",
+      "description": "Working queues; should hover near zero when consumers keep up. Pulls rabbitmq_queue_messages from the prometheus plugin.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rabbitmq_queue_messages{queue=~\"raw-events|enriched-events\"}",
+          "legendFormat": "{{queue}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 28}
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Error budget burned (28d) — POST /events",
+      "description": "V2 PR 7 / OBS-161. SLO: 99% of POST /events return 2xx in ≤500ms over 28d. Stat shows % of the 1% error budget consumed; thresholds at 50% and 100%.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "slo:track_budget_burn_pct:28d * 100",
+          "legendFormat": "burned"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"value": null, "color": "green"},
+              {"value": 50, "color": "yellow"},
+              {"value": 100, "color": "red"}
+            ]
+          }
+        }
+      },
+      "options": {"colorMode": "background", "graphMode": "area", "textMode": "auto"},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 36}
+    },
+    {
+      "id": 10,
+      "type": "logs",
+      "title": "Recent ERROR logs (V3 PR 8)",
+      "description": "From Loki, populated by Alloy parsing each service's slog JSON output. Lines retain trace_id/span_id as structured metadata; click an ERROR line to deep-link into Tempo.",
+      "datasource": {"type": "loki", "uid": "loki"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{level=\"ERROR\"}",
+          "queryType": "range"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "dedupStrategy": "none",
+        "enableLogDetails": true
+      },
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 44}
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 38,
+  "tags": ["red", "obs-stack"],
+  "templating": {"list": []},
+  "time": {"from": "now-15m", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "Observability Stack — RED + Drops",
+  "uid": "obs-red",
+  "version": 2
+}

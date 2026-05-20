@@ -1,0 +1,163 @@
+{
+  "annotations": {"list": []},
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [
+    {
+      "title": "Back to RED + Drops",
+      "type": "dashboards",
+      "tags": ["red"],
+      "asDropdown": false,
+      "targetBlank": false
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "RabbitMQ — U/S/E",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "collapsed": false
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "U — connections + channels",
+      "description": "Utilisation: how many client connections + channels the broker is currently handling. From rabbitmq_prometheus.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "rabbitmq_connections", "legendFormat": "connections"},
+        {"refId": "B", "expr": "rabbitmq_channels",    "legendFormat": "channels"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}},
+      "gridPos": {"h": 7, "w": 8, "x": 0, "y": 1}
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "S — total queue depth",
+      "description": "Saturation: messages waiting across all queues. A climbing line means producers outpace consumers.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "sum(rabbitmq_queue_messages)", "legendFormat": "all queues"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}},
+      "gridPos": {"h": 7, "w": 8, "x": 8, "y": 1}
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "E — disk-free + memory headroom",
+      "description": "Errors-imminent: when these dip toward 0 the broker enters flow-control and producers stall.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "rabbitmq_disk_space_available_bytes", "legendFormat": "disk available"},
+        {"refId": "B", "expr": "rabbitmq_resident_memory_limit_bytes - rabbitmq_process_resident_memory_bytes", "legendFormat": "memory headroom"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "decbytes", "min": 0}},
+      "gridPos": {"h": 7, "w": 8, "x": 16, "y": 1}
+    },
+
+    {
+      "id": 5,
+      "type": "row",
+      "title": "Postgres — U/S/E",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 8},
+      "collapsed": false
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "U — active backends",
+      "description": "Utilisation: connections currently held against each database. From OTel postgresqlreceiver.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "postgresql_backends", "legendFormat": "{{postgresql_database_name}}"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}},
+      "gridPos": {"h": 7, "w": 8, "x": 0, "y": 9}
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "S — block-read rate (cache miss)",
+      "description": "Saturation proxy: blocks read from disk per second. A spike means the working set has outgrown the buffer cache.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "sum by (postgresql_database_name) (rate(postgresql_blocks_read_total[5m]))", "legendFormat": "{{postgresql_database_name}}"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops", "min": 0}},
+      "gridPos": {"h": 7, "w": 8, "x": 8, "y": 9}
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "E — rollbacks/sec",
+      "description": "Errors: transactions that didn't commit. Zero on a healthy demo workload. (Deadlocks are a separate metric; the OTel postgresqlreceiver doesn't emit it by default in 0.151, so it's omitted here.)",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "sum by (postgresql_database_name) (rate(postgresql_rollbacks_total[5m]))",  "legendFormat": "rollbacks {{postgresql_database_name}}"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops", "min": 0}},
+      "gridPos": {"h": 7, "w": 8, "x": 16, "y": 9}
+    },
+
+    {
+      "id": 9,
+      "type": "row",
+      "title": "Host (Linux VM under Docker Desktop)",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 16},
+      "collapsed": false
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "U — CPU utilisation by mode",
+      "description": "Utilisation, computed from rate(system_cpu_time_seconds_total) since the OTel receiver emits cumulative CPU-time, not a pre-computed utilisation gauge. Reads /hostfs/proc — the Linux VM Docker Desktop runs, not the macOS host. Useful relative trends only.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "avg by (state) (rate(system_cpu_time_seconds_total[1m]))", "legendFormat": "{{state}}"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}},
+      "gridPos": {"h": 7, "w": 8, "x": 0, "y": 17}
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "S — load average (1m / 5m / 15m)",
+      "description": "Saturation: tasks runnable+uninterruptible vs. cores. Sustained load > nproc means CPU-saturated.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "system_cpu_load_average_1m",  "legendFormat": "1m"},
+        {"refId": "B", "expr": "system_cpu_load_average_5m",  "legendFormat": "5m"},
+        {"refId": "C", "expr": "system_cpu_load_average_15m", "legendFormat": "15m"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}},
+      "gridPos": {"h": 7, "w": 8, "x": 8, "y": 17}
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "E — memory used vs. cached",
+      "description": "Errors-imminent (memory pressure proxy). When 'used' climbs and 'cached' stays flat, the working set is real; if cached collapses you've got pressure.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "sum by (state) (system_memory_usage_bytes)", "legendFormat": "{{state}}"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "decbytes", "min": 0}},
+      "gridPos": {"h": 7, "w": 8, "x": 16, "y": 17}
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 38,
+  "tags": ["use", "obs-stack"],
+  "templating": {"list": []},
+  "time": {"from": "now-15m", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "Resources — USE",
+  "uid": "obs-use",
+  "version": 1
+}

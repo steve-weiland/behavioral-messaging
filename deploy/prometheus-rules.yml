@@ -1,0 +1,95 @@
+# V2 PR 7 — SLO recording rules + multi-window multi-burn-rate alerts.
+#
+# SLO (OBS-160):
+#   99% of POST /events requests return 2xx within 500 ms,
+#   measured over a rolling 28-day window.
+#
+# A "good" request is 2xx AND served within the 500 ms histogram bucket.
+# Error ratio = 1 − good/total. Error budget = 1 − SLO_target = 1%.
+# Burn rate = error_ratio / 0.01 — i.e., how many times faster than steady-
+# state we'd consume the budget.
+#
+# Multi-window multi-burn-rate (Q24 / OBS-162) per SRE workbook §5:
+#   page on   (1h × 14.4) AND (5m × 14.4)   — burns budget in <2d
+#   ticket on (6h × 6   ) AND (30m × 6 )    — burns budget in <5d
+# The AND across two windows filters out single-blip noise without
+# hiding sustained slow burns.
+groups:
+  - name: slo-recording
+    interval: 30s
+    rules:
+      # Total POST /events rate over various windows.
+      - record: slo:track_total:rate5m
+        expr: sum(rate(http_server_request_duration_seconds_count{service_name="track-api",http_route="/events",http_request_method="POST"}[5m]))
+      - record: slo:track_total:rate30m
+        expr: sum(rate(http_server_request_duration_seconds_count{service_name="track-api",http_route="/events",http_request_method="POST"}[30m]))
+      - record: slo:track_total:rate1h
+        expr: sum(rate(http_server_request_duration_seconds_count{service_name="track-api",http_route="/events",http_request_method="POST"}[1h]))
+      - record: slo:track_total:rate6h
+        expr: sum(rate(http_server_request_duration_seconds_count{service_name="track-api",http_route="/events",http_request_method="POST"}[6h]))
+
+      # Good = 2xx AND ≤500ms. Histogram bucket le="0.5" already counts
+      # everything ≤500ms; status filter drops 5xx.
+      - record: slo:track_good:rate5m
+        expr: sum(rate(http_server_request_duration_seconds_bucket{service_name="track-api",http_route="/events",http_request_method="POST",http_response_status_code=~"2..",le="0.5"}[5m]))
+      - record: slo:track_good:rate30m
+        expr: sum(rate(http_server_request_duration_seconds_bucket{service_name="track-api",http_route="/events",http_request_method="POST",http_response_status_code=~"2..",le="0.5"}[30m]))
+      - record: slo:track_good:rate1h
+        expr: sum(rate(http_server_request_duration_seconds_bucket{service_name="track-api",http_route="/events",http_request_method="POST",http_response_status_code=~"2..",le="0.5"}[1h]))
+      - record: slo:track_good:rate6h
+        expr: sum(rate(http_server_request_duration_seconds_bucket{service_name="track-api",http_route="/events",http_request_method="POST",http_response_status_code=~"2..",le="0.5"}[6h]))
+
+      # Error ratio per window. clamp_min so an empty stack ((0/0=NaN))
+      # evaluates to 0 instead of firing a phantom alert.
+      - record: slo:track_error_ratio:5m
+        expr: 1 - (slo:track_good:rate5m / clamp_min(slo:track_total:rate5m, 1e-9))
+      - record: slo:track_error_ratio:30m
+        expr: 1 - (slo:track_good:rate30m / clamp_min(slo:track_total:rate30m, 1e-9))
+      - record: slo:track_error_ratio:1h
+        expr: 1 - (slo:track_good:rate1h / clamp_min(slo:track_total:rate1h, 1e-9))
+      - record: slo:track_error_ratio:6h
+        expr: 1 - (slo:track_good:rate6h / clamp_min(slo:track_total:rate6h, 1e-9))
+
+      # Error budget burned over 28d (used by the dashboard stat panel).
+      # 1 − ((1 − error_ratio_28d) / SLO_target) where SLO_target = 0.99.
+      # Simplifies to error_ratio_28d / (1 − SLO_target) = error_ratio_28d / 0.01.
+      - record: slo:track_budget_burn_pct:28d
+        expr: |
+          (1 - (
+            sum(rate(http_server_request_duration_seconds_bucket{service_name="track-api",http_route="/events",http_request_method="POST",http_response_status_code=~"2..",le="0.5"}[28d]))
+            /
+            clamp_min(sum(rate(http_server_request_duration_seconds_count{service_name="track-api",http_route="/events",http_request_method="POST"}[28d])), 1e-9)
+          )) / 0.01
+
+  - name: slo-alerts
+    rules:
+      # Page: fast burn — 14.4× over 1h AND 5m.
+      # 14.4 × 0.01 (error budget) = 0.144 = 14.4% error rate.
+      - alert: TrackBurnRatePage
+        expr: |
+          slo:track_error_ratio:1h > 0.144
+          and
+          slo:track_error_ratio:5m > 0.144
+        for: 2m
+        labels:
+          severity: page
+          slo: track-api-availability
+        annotations:
+          summary: "Fast burn — POST /events SLO budget exhausting in <2d"
+          description: "Error ratio over 1h and 5m windows both exceed 14.4× the steady-state burn that would deplete the 28d error budget."
+          runbook_url: "https://github.com/steveweiland/behavioral-messaging/blob/main/RUNBOOK.md#burn-rate-page"
+
+      # Ticket: slow burn — 6× over 6h AND 30m.
+      - alert: TrackBurnRateTicket
+        expr: |
+          slo:track_error_ratio:6h > 0.06
+          and
+          slo:track_error_ratio:30m > 0.06
+        for: 15m
+        labels:
+          severity: ticket
+          slo: track-api-availability
+        annotations:
+          summary: "Slow burn — POST /events SLO budget exhausting in <5d"
+          description: "Error ratio over 6h and 30m windows both exceed 6× the steady-state burn."
+          runbook_url: "https://github.com/steveweiland/behavioral-messaging/blob/main/RUNBOOK.md#burn-rate-ticket"
