@@ -2,7 +2,7 @@
 
 | Field   | Value         |
 |---------|---------------|
-| Version | 0.1 (V1 draft)|
+| Version | 0.1.3 (V1)    |
 | Author  | Steve Weiland |
 | Date    | 2026-05-20    |
 | Status  | Draft         |
@@ -107,6 +107,21 @@ Requirements use [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) keywords:
 | `BM‑36` | The scan-based check **MUST** read at most `segmentScanEventLimit` (V1 default 1000) events per person via `eventstore.RecentByPerson(... LIMIT ?)` ordered by `received_at DESC`. The cap protects V1 from hot-profile pathology; V2's incremental bitmap maintenance removes it. |
 | `BM‑37` | Segment definitions **MUST** be validated at `POST` time (recognized ops, required fields per op, depth cap); validation failures return `400` with a human-readable reason. |
 | `BM‑38` | The segment evaluator package (`internal/segment`) **MUST** expose its `Condition` + `EvalContext` + `Evaluate` API to be reused by the campaign-trigger handler in V1 PR 4. Same tree, two callers. |
+
+#### 3.1.4c Campaign trigger + in-process fan-out (V1 PR 4)
+
+| ID | Requirement |
+|----|-------------|
+| `BM‑70` | `track-api` **MUST** expose `POST /campaigns` accepting `{ campaign_id, name, trigger, template }`. `X-Workspace-ID` required. Request body **MUST** be capped at 32 KiB; `template` **MUST** be capped at 16 KiB. |
+| `BM‑71` | `trigger` **MUST** be a `segment.Condition` tree validated against the same six-op grammar (BM‑31) — and/or/not, attr_eq, attr_exists, event_seen — including the depth cap of 8. Validation **MUST** run at `POST` time; failures return `400` with a human-readable reason. |
+| `BM‑72` | `template` **MUST** be a Go `text/template` string, parsed at `POST` time with `Option("missingkey=zero")` so absent attributes render as the zero value rather than erroring. Parse failures return `400`. |
+| `BM‑73` | `track-api` **MUST** expose `GET /campaigns/{campaign_id}` returning the stored row or `404`. |
+| `BM‑74` | The `POST /events` handler **MUST** hand each accepted event to the in-process `Dispatcher` (after `eventstore.Insert` succeeds, BM‑23). The Dispatcher **MUST** be a single buffered channel (V1 default 1024) consumed by one goroutine. When the buffer is full the producer **MUST** drop the event and increment `campaign_queue_dropped_total{workspace_id}`; the response to the client is unaffected. |
+| `BM‑75` | The Dispatcher **MUST**, per event, list all campaigns in the workspace, evaluate each trigger against `EvalContext{Person: p, Events: [inbound_event]}` — a single-event view where `event_seen(name)` matches iff the inbound event's name is the target — and, for each match: render the template, POST the rendered message to `STUB_RECEIVER_URL`, and insert a `journey_enrolments` row. |
+| `BM‑76` | Trigger evaluation **MUST** reuse `internal/segment`'s `DecodeCondition` + `Validate` + `Evaluate` API verbatim. Same tree, two callers. |
+| `BM‑77` | The render context **MUST** be `{ Person, Event, Attrs, Now }` where `Attrs` is the person's attributes JSON pre-decoded into `map[string]any`. A render failure at dispatch time **MUST** be logged + recorded on the span and **MUST NOT** block other matching campaigns for the same event. |
+| `BM‑78` | A `journey_enrolments` row **MUST** be inserted on every successful dispatch with `(workspace_id, enrolment_id, campaign_id, person_id, triggered_by=event_id)`. Audit-insert failure after a successful HTTP dispatch **MUST NOT** reverse the dispatch — V1 acceptable; V2's two-phase dispatch closes this gap. |
+| `BM‑79` | The Dispatcher **MUST** publish `campaign_queue_dropped_total{workspace_id}` and `campaign_dispatched_total{workspace_id, campaign_id}` counters via the global OTel meter. The async `campaign.process` span **MUST** join the producer's trace by re-using the inbound event's span context (`trace.ContextWithSpanContext(context.Background(), ...)` so the consumer outlives the HTTP handler). |
 
 #### 3.1.4 Stub receiver
 
@@ -230,6 +245,48 @@ Example definition: `plan="pro" AND has viewed_pricing`:
 }
 ```
 
+### HTTP — `track-api` `/campaigns` (V1 PR 4)
+
+```
+POST /campaigns
+Headers:
+  X-Workspace-ID: ws_alpha
+Body:
+  campaign_id: string (required, [A-Za-z0-9_-]{1,64})
+  name:        string (required, ≤ 255 chars)
+  trigger:     condition tree (same grammar as segments — BM-31)
+  template:    string (Go text/template body, ≤ 16 KiB)
+
+→ 201 Created    {"status":"ok"}
+→ 400 Bad Request {"error":"trigger: ..."} | {"error":"template: ..."}
+
+GET /campaigns/{campaign_id}
+→ 200 OK         {"workspace_id":..., "campaign_id":..., "name":..., "trigger":{...}, "template":"...", "created_at":..., "updated_at":...}
+→ 404 Not Found
+```
+
+Example trigger + template:
+
+```json
+{
+  "campaign_id": "welcome_pro",
+  "name": "Welcome Pro Users",
+  "trigger": {
+    "op": "and",
+    "conditions": [
+      {"op": "attr_eq",    "key":  "plan",      "value": "pro"},
+      {"op": "event_seen", "name": "signed_up"}
+    ]
+  },
+  "template": "Welcome {{.Person.PersonID}} — your {{.Attrs.plan}} plan is live."
+}
+```
+
+The template's render context exposes `Person` (full struct), `Event` (the
+inbound `event.Event`), `Attrs` (decoded `map[string]any` from
+`person.attributes`), and `Now` (UTC). Absent attributes render as
+`<no value>` rather than erroring (`missingkey=zero`).
+
 ### HTTP — `stub-receiver`
 
 ```
@@ -319,3 +376,4 @@ bottleneck-migration narrative with hardware-pinned numbers.
 | 0.1     | 2026-05-20 | Steve Weiland | V1 draft. Two services, MySQL, in-process channel, scan-based segment eval (placeholder — V1 PR 2 wires it). Resolved Q1–Q9. |
 | 0.1.1   | 2026-05-21 | Steve Weiland | V1 PR 2: person store. `BM‑26..29` added — `POST/GET /people` and event-path person auto-create. JSON_MERGE_PATCH semantics (RFC 7396) for attribute upserts; null-value-deletes-key documented. §4 I/O surface updated. |
 | 0.1.2   | 2026-05-21 | Steve Weiland | V1 PR 3: segment store + scan-based evaluator. `BM‑30..38` added — six-op condition tree (and/or/not/attr_eq/attr_exists/event_seen), depth cap 8, structural JSON equality. `Condition` API will be reused by the V1 PR 4 campaign trigger. §4 I/O surface gains `/segments` + check endpoint. Q10–Q11 resolved (scan-based V1, V2 swaps to bitmaps). |
+| 0.1.3   | 2026-05-21 | Steve Weiland | V1 PR 4: campaign trigger + in-process fan-out. `BM‑70..79` added — `POST/GET /campaigns`, `Dispatcher` (buffered channel + single consumer goroutine, drop-on-full with Prometheus counter, async `campaign.process` span joined to the producer trace), trigger reuses `segment.Condition` verbatim with a single-event `EvalContext` (so `event_seen` matches the inbound event), Go `text/template` rendering with `missingkey=zero`, `journey_enrolments` audit insert per dispatch. The kickoff-PR direct `forwardToStub` smoke path is now routed through the Dispatcher's `dispatch` HTTP call. §4 I/O surface gains `/campaigns`. |

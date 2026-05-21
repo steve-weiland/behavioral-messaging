@@ -52,7 +52,9 @@ make down        # tear it all down
 | `POST http://localhost:8090/segments` | Define a segment with a JSON condition tree (`and`/`or`/`not` + `attr_eq`/`attr_exists`/`event_seen`). Depth cap 8. *(V1 PR 3)* |
 | `GET  http://localhost:8090/segments/<id>` | Read the stored definition. *(V1 PR 3)* |
 | `GET  http://localhost:8090/segments/<id>/check?person_id=<pid>` | Scan-eval membership for one person. V2's bitmap path removes the scan. *(V1 PR 3)* |
-| http://localhost:8091/healthz | `stub-receiver` (V1) |
+| `POST http://localhost:8090/campaigns` | Define a campaign — trigger (same condition tree as segments) + Go `text/template` body. Validates at insert time. *(V1 PR 4)* |
+| `GET  http://localhost:8090/campaigns/<id>` | Read the stored campaign. *(V1 PR 4)* |
+| http://localhost:8091/healthz | `stub-receiver` (V1) — receives the rendered template per dispatched campaign |
 | http://localhost:3030/explore | Grafana — Tempo / Prometheus / Loki datasources provisioned. Try `{resource.service.name="track-api"}` in Tempo Search. |
 | http://localhost:3030/d/obs-red | RED dashboard (carried from Build 5). V1 panels populate once traffic flows. |
 | http://localhost:3030/d/obs-use | USE dashboard (Build 5 carryover). MySQL row needs queries rewritten in a follow-up commit; host + RabbitMQ rows from Build 5 will show partial data only (no RabbitMQ in V1). |
@@ -92,11 +94,11 @@ behavioral-messaging/
 │   ├── logsx/                      Build 5 carryover — slog JSON + trace_id/span_id
 │   ├── person/                     V1.x — person store
 │   ├── segment/                    V1.x — condition tree parser; V2 — roaring bitmap engine
-│   ├── campaign/                   V1.x — single-step send
+│   ├── campaign/                   V1 PR 4 — trigger eval + Go text/template render + Dispatcher (in-process channel + 1 consumer goroutine)
 │   └── journey/                    V3 — FSM with delays
 ├── deploy/                         Build 5 carryover — collector/tempo/prom/loki/alloy/grafana
 │   └── grafana/provisioning/dashboards/ — red.json + use.json (panels TBD-rewritten for MySQL)
-├── migrations/001_v1.sql           workspaces, people, events, journey_enrolments, idempotency_keys
+├── migrations/                     001_v1.sql (workspaces, people, events, journey_enrolments, idempotency_keys) · 002_segments.sql · 003_campaigns.sql
 └── chaos/                          load + chaos scripts (added next PR)
 ```
 

@@ -4,10 +4,10 @@
 //   - Validates body + X-Workspace-ID header.
 //   - Generates UUIDv4 event_id server-side.
 //   - INSERTs to MySQL events (idempotent on (workspace_id, event_id)).
-//   - Fires a synchronous HTTP POST to STUB_RECEIVER_URL — the simplest
-//     downstream that proves trace propagation works end-to-end. V1 PR 2+
-//     will route through an in-process channel + campaign worker; for the
-//     kickoff PR the direct call is the smoke test for the scaffolding.
+//   - Hands the event to the in-process campaign Dispatcher, which fans
+//     out to whichever campaigns the workspace has defined and POSTs
+//     rendered messages to STUB_RECEIVER_URL. V2 replaces the in-process
+//     channel with RabbitMQ; the producer-side Submit call stays.
 //
 // Instrumentation:
 //   - otelhttp middleware around the mux (HTTP server span).
@@ -17,7 +17,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -36,6 +35,7 @@ import (
 	"github.com/google/uuid"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
+	"github.com/steveweiland/behavioral-messaging/internal/campaign"
 	"github.com/steveweiland/behavioral-messaging/internal/event"
 	"github.com/steveweiland/behavioral-messaging/internal/eventstore"
 	"github.com/steveweiland/behavioral-messaging/internal/logsx"
@@ -87,6 +87,18 @@ type segmentCheckResponse struct {
 	Member      bool   `json:"member"`
 }
 
+// V1 PR 4 caps. Trigger uses the same depth-8 condition tree as segments;
+// template is bounded to keep the dispatcher's render loop predictable.
+const maxCampaignBodyBytes = 32 * 1024
+const maxTemplateBytes = 16 * 1024
+
+type defineCampaignRequest struct {
+	CampaignID string          `json:"campaign_id"`
+	Name       string          `json:"name"`
+	Trigger    json.RawMessage `json:"trigger"`
+	Template   string          `json:"template"`
+}
+
 func main() {
 	rootCtx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -110,6 +122,13 @@ func main() {
 		Timeout:   5 * time.Second,
 		Transport: otelhttp.NewTransport(http.DefaultTransport),
 	}
+
+	// V1 PR 4: in-process campaign fan-out. Single consumer goroutine,
+	// buffered channel, drop-on-full with a Prometheus counter. V2
+	// replaces the channel with RabbitMQ; the Dispatcher API stays.
+	dispatcher := campaign.NewDispatcher(db, httpClient, stubURL)
+	dispatcher.Start(rootCtx)
+	defer dispatcher.Stop()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -367,6 +386,114 @@ func main() {
 		}
 	})
 
+	// V1 PR 4: campaigns. trigger validates as a segment.Condition
+	// (same six-op tree); template parses with text/template at insert
+	// time so bad shapes can't reach the dispatcher.
+	mux.HandleFunc("/campaigns", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		workspace := r.Header.Get("X-Workspace-ID")
+		if !validID(workspace) {
+			writeErr(w, http.StatusBadRequest, "X-Workspace-ID required ([A-Za-z0-9_-]{1,64})")
+			return
+		}
+		body, err := readBody(r, maxCampaignBodyBytes)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		var req defineCampaignRequest
+		if err := json.Unmarshal(body, &req); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		if !validID(req.CampaignID) {
+			writeErr(w, http.StatusBadRequest, "campaign_id required ([A-Za-z0-9_-]{1,64})")
+			return
+		}
+		if req.Name == "" || len(req.Name) > 255 {
+			writeErr(w, http.StatusBadRequest, "name required, ≤ 255 chars")
+			return
+		}
+		if len(req.Trigger) == 0 {
+			writeErr(w, http.StatusBadRequest, "trigger required")
+			return
+		}
+		if req.Template == "" || len(req.Template) > maxTemplateBytes {
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("template required, ≤ %d bytes", maxTemplateBytes))
+			return
+		}
+		cond, err := segment.DecodeCondition(req.Trigger)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "trigger: "+err.Error())
+			return
+		}
+		if err := cond.Validate(); err != nil {
+			writeErr(w, http.StatusBadRequest, "trigger: "+err.Error())
+			return
+		}
+		if err := campaign.ParseTemplate(req.CampaignID, req.Template); err != nil {
+			writeErr(w, http.StatusBadRequest, "template: "+err.Error())
+			return
+		}
+		c := campaign.Campaign{
+			WorkspaceID: workspace,
+			CampaignID:  req.CampaignID,
+			Name:        req.Name,
+			Trigger:     req.Trigger,
+			Template:    req.Template,
+		}
+		if err := campaign.Create(r.Context(), db, c); err != nil {
+			slog.ErrorContext(r.Context(), "campaign create failed",
+				slog.String("workspace_id", workspace),
+				slog.String("campaign_id", req.CampaignID),
+				slog.Any("error", err))
+			writeErr(w, http.StatusInternalServerError, "store failed")
+			return
+		}
+		slog.InfoContext(r.Context(), "campaign created",
+			slog.String("workspace_id", workspace),
+			slog.String("campaign_id", req.CampaignID),
+			slog.String("name", req.Name))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
+
+	mux.HandleFunc("/campaigns/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		workspace := r.Header.Get("X-Workspace-ID")
+		if !validID(workspace) {
+			writeErr(w, http.StatusBadRequest, "X-Workspace-ID required ([A-Za-z0-9_-]{1,64})")
+			return
+		}
+		campaignID := strings.TrimPrefix(r.URL.Path, "/campaigns/")
+		if !validID(campaignID) {
+			writeErr(w, http.StatusBadRequest, "campaign_id path segment required")
+			return
+		}
+		c, err := campaign.Get(r.Context(), db, workspace, campaignID)
+		if errors.Is(err, campaign.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "campaign not found")
+			return
+		}
+		if err != nil {
+			slog.ErrorContext(r.Context(), "campaign get failed",
+				slog.String("workspace_id", workspace),
+				slog.String("campaign_id", campaignID),
+				slog.Any("error", err))
+			writeErr(w, http.StatusInternalServerError, "store failed")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(c)
+	})
+
 	mux.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -423,15 +550,12 @@ func main() {
 			return
 		}
 
-		// Smoke-test downstream: hand the event to stub-receiver synchronously.
-		// V1 PR 2 will route via an in-process channel + campaign worker; this
-		// direct call exists only to prove HTTP→DB→HTTP trace propagation.
-		if err := forwardToStub(r.Context(), httpClient, stubURL, ev); err != nil {
-			slog.WarnContext(r.Context(), "stub forward failed",
-				slog.String("event_id", ev.EventID),
-				slog.Any("error", err))
-			// Don't fail the request — event is durably stored.
-		}
+		// Hand the event to the in-process campaign dispatcher. Submit
+		// detaches from the request context so the consumer outlives the
+		// handler; the producer's span context is preserved so the async
+		// campaign.process span joins this trace. Drop-on-full is logged
+		// + counted inside Submit.
+		dispatcher.Submit(r.Context(), ev)
 
 		slog.InfoContext(r.Context(), "event accepted",
 			slog.String("workspace_id", workspace),
@@ -461,27 +585,6 @@ func main() {
 	stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer stopCancel()
 	_ = server.Shutdown(stopCtx)
-}
-
-func forwardToStub(ctx context.Context, c *http.Client, base string, ev event.Event) error {
-	body, err := json.Marshal(ev)
-	if err != nil {
-		return fmt.Errorf("marshal: %w", err)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/", bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("new request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.Do(req)
-	if err != nil {
-		return fmt.Errorf("do: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
-		return fmt.Errorf("stub status=%d", resp.StatusCode)
-	}
-	return nil
 }
 
 // openDBWithRetry — MySQL's healthcheck flips before it's truly ready for

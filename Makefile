@@ -2,8 +2,8 @@
 
 COMPOSE ?= docker compose
 
-.PHONY: help up down logs ps rebuild seed seed-people seed-segments \
-	mysql events-count people-count segments-count
+.PHONY: help up down logs ps rebuild seed seed-people seed-segments seed-campaign \
+	mysql events-count people-count segments-count campaigns-count enrolments-count
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  %-12s %s\n", $$1, $$2}'
@@ -59,6 +59,12 @@ people-count: ## SELECT count(*) FROM people
 segments-count: ## SELECT count(*) FROM segments
 	$(COMPOSE) exec -T mysql mysql -ubm -pbm bm -e 'SELECT count(*) FROM segments;'
 
+campaigns-count: ## SELECT count(*) FROM campaigns
+	$(COMPOSE) exec -T mysql mysql -ubm -pbm bm -e 'SELECT count(*) FROM campaigns;'
+
+enrolments-count: ## SELECT count(*) FROM journey_enrolments
+	$(COMPOSE) exec -T mysql mysql -ubm -pbm bm -e 'SELECT count(*) FROM journey_enrolments;'
+
 seed-segments: ## Define active_pro + two people + check membership before/after event (V1 PR 3)
 	@echo "1. define active_pro = plan=pro AND viewed_pricing"
 	@curl -fsS -X POST -H 'Content-Type: application/json' -H 'X-Workspace-ID: ws_alpha' \
@@ -84,3 +90,29 @@ seed-segments: ## Define active_pro + two people + check membership before/after
 	@echo "5. check membership AFTER event (expect alice true, bob false)"
 	@printf "  alice: "; curl -fsS -H 'X-Workspace-ID: ws_alpha' 'http://localhost:8090/segments/active_pro/check?person_id=p_alice'; echo
 	@printf "  bob:   "; curl -fsS -H 'X-Workspace-ID: ws_alpha' 'http://localhost:8090/segments/active_pro/check?person_id=p_bob'; echo
+
+seed-campaign: ## Define welcome_pro + identify two people + fire signed_up + verify enrolments (V1 PR 4)
+	@echo "1. define welcome_pro = (plan=pro AND event_seen signed_up) → templated welcome message"
+	@curl -fsS -X POST -H 'Content-Type: application/json' -H 'X-Workspace-ID: ws_alpha' \
+		-d '{"campaign_id":"welcome_pro","name":"Welcome Pro users","trigger":{"op":"and","conditions":[{"op":"attr_eq","key":"plan","value":"pro"},{"op":"event_seen","name":"signed_up"}]},"template":"Welcome {{.Person.PersonID}} — your {{.Attrs.plan}} plan is live."}' \
+		http://localhost:8090/campaigns && echo
+	@echo
+	@echo "2. identify pr4a (plan=pro) and pr4b (plan=free)"
+	@curl -fsS -X POST -H 'Content-Type: application/json' -H 'X-Workspace-ID: ws_alpha' \
+		-d '{"person_id":"pr4a","attributes":{"plan":"pro"}}' http://localhost:8090/people > /dev/null && echo "  pr4a ok"
+	@curl -fsS -X POST -H 'Content-Type: application/json' -H 'X-Workspace-ID: ws_alpha' \
+		-d '{"person_id":"pr4b","attributes":{"plan":"free"}}' http://localhost:8090/people > /dev/null && echo "  pr4b ok"
+	@echo
+	@echo "3. track signed_up for BOTH (only pr4a should match)"
+	@curl -fsS -X POST -H 'Content-Type: application/json' -H 'X-Workspace-ID: ws_alpha' \
+		-d '{"person_id":"pr4a","event_name":"signed_up","payload":{}}' http://localhost:8090/events && echo
+	@curl -fsS -X POST -H 'Content-Type: application/json' -H 'X-Workspace-ID: ws_alpha' \
+		-d '{"person_id":"pr4b","event_name":"signed_up","payload":{}}' http://localhost:8090/events && echo
+	@echo
+	@sleep 1
+	@echo "4. journey_enrolments for welcome_pro (expect ONE row, person_id=pr4a):"
+	@$(COMPOSE) exec -T mysql mysql -ubm -pbm bm -e \
+		"SELECT campaign_id, person_id, triggered_by FROM journey_enrolments WHERE campaign_id='welcome_pro' ORDER BY enrolled_at DESC LIMIT 5;"
+	@echo
+	@echo "5. stub-receiver log tail (the rendered template):"
+	@$(COMPOSE) logs --tail=20 stub-receiver | grep -E 'received|rendered|Welcome' || true
