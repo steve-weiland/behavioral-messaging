@@ -63,18 +63,19 @@
     {
       "id": 5,
       "type": "row",
-      "title": "Postgres — U/S/E",
+      "title": "MySQL — U/S/E",
       "gridPos": {"h": 1, "w": 24, "x": 0, "y": 8},
       "collapsed": false
     },
     {
       "id": 6,
       "type": "timeseries",
-      "title": "U — active backends",
-      "description": "Utilisation: connections currently held against each database. From OTel postgresqlreceiver.",
+      "title": "U — connected threads",
+      "description": "Utilisation: client threads currently connected to the MySQL server. Direct analog of Postgres's pg_stat_database.numbackends. From OTel mysqlreceiver (mysql_threads{kind=\"connected\"}).",
       "datasource": {"type": "prometheus", "uid": "prometheus"},
       "targets": [
-        {"refId": "A", "expr": "postgresql_backends", "legendFormat": "{{postgresql_database_name}}"}
+        {"refId": "A", "expr": "mysql_threads{kind=\"connected\"}", "legendFormat": "connected"},
+        {"refId": "B", "expr": "mysql_threads{kind=\"running\"}",   "legendFormat": "running"}
       ],
       "fieldConfig": {"defaults": {"unit": "short", "min": 0}},
       "gridPos": {"h": 7, "w": 8, "x": 0, "y": 9}
@@ -82,11 +83,12 @@
     {
       "id": 7,
       "type": "timeseries",
-      "title": "S — block-read rate (cache miss)",
-      "description": "Saturation proxy: blocks read from disk per second. A spike means the working set has outgrown the buffer cache.",
+      "title": "S — InnoDB buffer-pool disk reads/sec",
+      "description": "Saturation proxy: actual disk reads from the InnoDB buffer pool. A spike means the working set has outgrown buffer-pool RAM and we're paying for cache misses. read_requests is the logical read rate; reads is the subset that missed cache.",
       "datasource": {"type": "prometheus", "uid": "prometheus"},
       "targets": [
-        {"refId": "A", "expr": "sum by (postgresql_database_name) (rate(postgresql_blocks_read_total[5m]))", "legendFormat": "{{postgresql_database_name}}"}
+        {"refId": "A", "expr": "rate(mysql_buffer_pool_operations_total{operation=\"reads\"}[5m])",         "legendFormat": "disk reads"},
+        {"refId": "B", "expr": "rate(mysql_buffer_pool_operations_total{operation=\"read_requests\"}[5m])", "legendFormat": "logical reads"}
       ],
       "fieldConfig": {"defaults": {"unit": "ops", "min": 0}},
       "gridPos": {"h": 7, "w": 8, "x": 8, "y": 9}
@@ -94,11 +96,12 @@
     {
       "id": 8,
       "type": "timeseries",
-      "title": "E — rollbacks/sec",
-      "description": "Errors: transactions that didn't commit. Zero on a healthy demo workload. (Deadlocks are a separate metric; the OTel postgresqlreceiver doesn't emit it by default in 0.151, so it's omitted here.)",
+      "title": "E — row-lock + table-lock waits/sec",
+      "description": "Errors: lock contention. Zero on healthy single-writer demo workloads. Non-zero means concurrent transactions are blocking on InnoDB row locks (row_locks{kind=\"waits\"}) or MyISAM table locks (locks{kind=\"waited\"}). V2's RabbitMQ-mediated fan-out distributes writes; expect this panel to wake up under V2 soak load.",
       "datasource": {"type": "prometheus", "uid": "prometheus"},
       "targets": [
-        {"refId": "A", "expr": "sum by (postgresql_database_name) (rate(postgresql_rollbacks_total[5m]))",  "legendFormat": "rollbacks {{postgresql_database_name}}"}
+        {"refId": "A", "expr": "rate(mysql_row_locks_total{kind=\"waits\"}[5m])", "legendFormat": "row-lock waits"},
+        {"refId": "B", "expr": "rate(mysql_locks_total{kind=\"waited\"}[5m])",   "legendFormat": "table-lock waits"}
       ],
       "fieldConfig": {"defaults": {"unit": "ops", "min": 0}},
       "gridPos": {"h": 7, "w": 8, "x": 16, "y": 9}
