@@ -85,6 +85,15 @@ Requirements use [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) keywords:
 | `BM‑24` | `track-api` **MUST** respond `202 Accepted` with `{ "event_id": "<uuid>" }` on success. |
 | `BM‑25` | `track-api` **MUST** expose `GET /healthz` → `{"status":"ok"}`. |
 
+#### 3.1.4a Person store (V1 PR 2)
+
+| ID | Requirement |
+|----|-------------|
+| `BM‑26` | `track-api` **MUST** expose `POST /people` accepting JSON `{ person_id, attributes }`. `X-Workspace-ID` header required (same validation as `/events`). Request bodies **MUST** be capped at 16 KiB; oversized requests **MUST** return `400`. |
+| `BM‑27` | `attributes` **MUST** be a JSON object. `POST /people` **MUST** upsert via MySQL `JSON_MERGE_PATCH(existing, new)` — RFC 7396 semantics: new keys overwrite, omitted keys preserved, `null` values delete the key. `updated_at` **MUST** refresh on every upsert. |
+| `BM‑28` | `track-api` **MUST** expose `GET /people/{person_id}` returning `{ workspace_id, person_id, attributes, created_at, updated_at }` or `404` when absent. |
+| `BM‑29` | `POST /events` **MUST** ensure the referenced `people` row exists before the `events` insert. Implementation: `INSERT IGNORE INTO people (workspace_id, person_id, attributes) VALUES (?, ?, JSON_OBJECT())`. Idempotent — existing rows are never clobbered. |
+
 #### 3.1.4 Stub receiver
 
 | ID | Requirement |
@@ -149,6 +158,27 @@ Body:
 
 → 400 Bad Request
   error: "Human-readable message"
+```
+
+### HTTP — `track-api` `/people` (V1 PR 2)
+
+```
+POST /people
+Headers:
+  X-Workspace-ID: ws_alpha
+Body:
+  person_id:  string (required, ≤ 128 chars)
+  attributes: object (required; JSON_MERGE_PATCH applied — null deletes a key)
+
+→ 202 Accepted   {"status":"ok"}
+→ 400 Bad Request {"error":"..."}
+
+GET /people/{person_id}
+Headers:
+  X-Workspace-ID: ws_alpha
+
+→ 200 OK         {"workspace_id":...,"person_id":...,"attributes":{...},"created_at":...,"updated_at":...}
+→ 404 Not Found  {"error":"not found"}
 ```
 
 ### HTTP — `stub-receiver`
@@ -236,3 +266,4 @@ bottleneck-migration narrative with hardware-pinned numbers.
 | Version | Date       | Author        | Notes |
 |---------|------------|---------------|-------|
 | 0.1     | 2026-05-20 | Steve Weiland | V1 draft. Two services, MySQL, in-process channel, scan-based segment eval (placeholder — V1 PR 2 wires it). Resolved Q1–Q9. |
+| 0.1.1   | 2026-05-21 | Steve Weiland | V1 PR 2: person store. `BM‑26..29` added — `POST/GET /people` and event-path person auto-create. JSON_MERGE_PATCH semantics (RFC 7396) for attribute upserts; null-value-deletes-key documented. §4 I/O surface updated. |

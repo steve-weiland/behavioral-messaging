@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"net/http"
@@ -39,6 +40,7 @@ import (
 	"github.com/steveweiland/behavioral-messaging/internal/eventstore"
 	"github.com/steveweiland/behavioral-messaging/internal/logsx"
 	"github.com/steveweiland/behavioral-messaging/internal/otelinit"
+	"github.com/steveweiland/behavioral-messaging/internal/person"
 )
 
 const serviceName = "track-api"
@@ -52,6 +54,15 @@ type intakeRequest struct {
 type intakeResponse struct {
 	EventID string `json:"event_id"`
 }
+
+type identifyRequest struct {
+	PersonID   string          `json:"person_id"`
+	Attributes json.RawMessage `json:"attributes"`
+}
+
+// 16 KiB cap on /people attribute payloads — matches the implicit cap
+// on event payloads. Reviewed in the V1 spec as BM-26.
+const maxAttributesBytes = 16 * 1024
 
 func main() {
 	rootCtx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -82,6 +93,91 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
+
+	// V1 PR 2: POST /people — identify / attribute upsert.
+	// MySQL JSON_MERGE_PATCH semantics per RFC 7396: new keys overwrite,
+	// omitted keys preserved, null values delete the key. (BM-26..BM-29.)
+	mux.HandleFunc("/people", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		workspace := r.Header.Get("X-Workspace-ID")
+		if !validID(workspace) {
+			writeErr(w, http.StatusBadRequest, "X-Workspace-ID required ([A-Za-z0-9_-]{1,64})")
+			return
+		}
+		body, err := readBody(r, maxAttributesBytes)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		var req identifyRequest
+		if err := json.Unmarshal(body, &req); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		if !validID(req.PersonID) {
+			writeErr(w, http.StatusBadRequest, "person_id required ([A-Za-z0-9_-]{1,128})")
+			return
+		}
+		if len(req.Attributes) == 0 {
+			req.Attributes = json.RawMessage(`{}`)
+		} else if !isJSONObject(req.Attributes) {
+			writeErr(w, http.StatusBadRequest, "attributes must be a JSON object")
+			return
+		}
+
+		if err := person.Upsert(r.Context(), db, workspace, req.PersonID, req.Attributes); err != nil {
+			slog.ErrorContext(r.Context(), "people upsert failed",
+				slog.String("workspace_id", workspace),
+				slog.String("person_id", req.PersonID),
+				slog.Any("error", err))
+			writeErr(w, http.StatusInternalServerError, "store failed")
+			return
+		}
+		slog.InfoContext(r.Context(), "person upserted",
+			slog.String("workspace_id", workspace),
+			slog.String("person_id", req.PersonID),
+			slog.Int("bytes", len(req.Attributes)))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
+
+	// V1 PR 2: GET /people/{person_id} — read one person back. 404 if absent.
+	mux.HandleFunc("/people/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		workspace := r.Header.Get("X-Workspace-ID")
+		if !validID(workspace) {
+			writeErr(w, http.StatusBadRequest, "X-Workspace-ID required ([A-Za-z0-9_-]{1,64})")
+			return
+		}
+		personID := strings.TrimPrefix(r.URL.Path, "/people/")
+		if !validID(personID) {
+			writeErr(w, http.StatusBadRequest, "person_id path segment required")
+			return
+		}
+		p, err := person.Get(r.Context(), db, workspace, personID)
+		if errors.Is(err, person.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "not found")
+			return
+		}
+		if err != nil {
+			slog.ErrorContext(r.Context(), "person get failed",
+				slog.String("workspace_id", workspace),
+				slog.String("person_id", personID),
+				slog.Any("error", err))
+			writeErr(w, http.StatusInternalServerError, "store failed")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(p)
+	})
+
 	mux.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -116,6 +212,18 @@ func main() {
 			Name:        req.EventName,
 			Payload:     req.Payload,
 			ReceivedAt:  time.Now().UTC(),
+		}
+		// V1 PR 2: tracking auto-creates the person row with empty
+		// attributes if absent — matches Customer.io's identify-on-track
+		// behaviour. INSERT IGNORE is a no-op on PK collision so
+		// existing rows are never clobbered. (BM-29.)
+		if err := person.EnsureExists(r.Context(), db, workspace, req.PersonID); err != nil {
+			slog.ErrorContext(r.Context(), "person ensure failed",
+				slog.String("workspace_id", workspace),
+				slog.String("person_id", req.PersonID),
+				slog.Any("error", err))
+			writeErr(w, http.StatusInternalServerError, "store failed")
+			return
 		}
 		if err := eventstore.Insert(r.Context(), db, ev); err != nil {
 			slog.ErrorContext(r.Context(), "events insert failed",
@@ -236,3 +344,29 @@ func validID(s string) bool {
 }
 
 func validEventName(s string) bool { return validID(s) }
+
+// readBody reads up to max+1 bytes; rejects if over max. Used by the
+// people-identify endpoint to enforce the V1 attribute payload cap.
+func readBody(r *http.Request, max int) (json.RawMessage, error) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, int64(max)+1))
+	if err != nil {
+		return nil, fmt.Errorf("read body: %w", err)
+	}
+	if len(body) > max {
+		return nil, fmt.Errorf("body exceeds %d bytes", max)
+	}
+	return body, nil
+}
+
+// isJSONObject — peek validation. Accepts {} or {...}; rejects arrays,
+// scalars, etc. Cheap pre-check that catches the most common mistakes
+// before they hit MySQL's JSON column validator.
+func isJSONObject(b []byte) bool {
+	for _, c := range b {
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			continue
+		}
+		return c == '{'
+	}
+	return false
+}

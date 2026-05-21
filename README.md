@@ -47,6 +47,8 @@ make down        # tear it all down
 | URL | What |
 |---|---|
 | http://localhost:8090/healthz | `track-api` (V1) — `{"status":"ok"}` |
+| `POST http://localhost:8090/people` | Identify / attribute upsert. `JSON_MERGE_PATCH` semantics — `null` value deletes the key. *(V1 PR 2)* |
+| `GET  http://localhost:8090/people/<id>` | Read one person back. *(V1 PR 2)* |
 | http://localhost:8091/healthz | `stub-receiver` (V1) |
 | http://localhost:3030/explore | Grafana — Tempo / Prometheus / Loki datasources provisioned. Try `{resource.service.name="track-api"}` in Tempo Search. |
 | http://localhost:3030/d/obs-red | RED dashboard (carried from Build 5). V1 panels populate once traffic flows. |
