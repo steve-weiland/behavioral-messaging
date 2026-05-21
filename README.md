@@ -15,7 +15,7 @@ changed, what now breaks" writeup with hardware-pinned measurements.
 | | |
 |--|--|
 | **Spec** | [`spec.md`](./spec.md) — RFC-2119 V1 + V2 + V3 requirements |
-| **Status** | `v0.1.0-foundation-scaffold`. Track API + MySQL + stub receiver wired end-to-end with trace context propagation through the full Build 5 observability stack. |
+| **Status** | `v0.1.0-foundation-complete`. Six V1 surfaces shipped — Track API, person store, segment store + scan eval, campaign trigger + in-process Dispatcher, stub receiver, full observability scaffold. V1 load-test run on 2026-05-21 — see [§ V1 ceiling](#v1-ceiling-on-this-hardware). |
 | **Stack** | Go 1.25 · MySQL 8.0 · OpenTelemetry SDK + Collector 0.151 · Tempo 2.10 · Prometheus 3.11 · Loki 3.7 · Grafana Alloy v1.16 · Grafana 13.0 · `docker compose` |
 
 ---
@@ -34,15 +34,97 @@ Multi-tenancy is **not** a tier — it's a cross-cutting V1 property
 ## Run it
 
 ```bash
-make up          # docker compose up -d --build (8 services in V1)
+make up          # docker compose up -d --build (9 services in V1)
 make seed        # POST 10 events at 1 req/s
-make load        # (V1.x) sustained-load driver
-make showcase    # (V1.x) steady + slow + chaos driver
+make seed-campaign # define welcome_pro + 2 people + fire signed_up — end-to-end smoke
+make load-quick  # 10s burst @ concurrency=5 — sanity-check the driver
+make load-soak   # 60s steady @ concurrency=20 — the V1 ceiling-search run
+make test        # go test ./...
 make mysql       # interactive mysql shell
-make down        # tear it all down
+make down        # tear it all down (compose down --volumes --remove-orphans)
 ```
 
-## Where to look (so far)
+## V1 ceiling on this hardware
+
+> The headline scale number is "observed on this hardware," not absolute.
+> A Customer.io reviewer sees through fabricated laptop numbers immediately.
+> The narrative is the **bottleneck-migration story**, not the throughput.
+
+### Hardware
+
+| | |
+|---|---|
+| **CPU** | Apple M4 Max — 14 cores (10 P + 4 E) |
+| **RAM** | 36 GB |
+| **OS**  | macOS 15.7.3 (build 24G419), aarch64 |
+| **Container runtime** | Docker Engine 28.0.4, linux/arm64 |
+| **Topology** | All 9 services on one host. `track-api` is one replica, default `GOMAXPROCS`, no resource limits. |
+
+### Soak configuration
+
+`./chaos/load-v1.sh` — closed-loop bash + curl driver. 20 background workers
+each hot-loops `POST /events` for 60 seconds against a pool of 50
+pre-identified persons (`plan=pro`). The `welcome_pro` campaign is defined
+once at prep so every inbound `signed_up` event matches a trigger and the
+Dispatcher actually fans out. No per-curl sleep — the system absorbs as
+many requests as it can.
+
+```
+$ make load-soak
+…
+events_sent     = 34095
+failures        = 0
+elapsed_s       = 60
+achieved_rate   = 568 events/s
+```
+
+### What the dashboards showed
+
+| Signal | Value | Source |
+|---|---|---|
+| HTTP `POST /events` acceptance rate | **568 events/s** sustained, 0 failures | track-api response from the driver |
+| `campaign_dispatched_total` over the run | **~196 events/s** steady-state | Prometheus counter, scoped to `workspace_id=ws_alpha,campaign_id=welcome_pro` |
+| `campaign_queue_dropped_total` over the run | **~370 drops/s** steady-state | Prometheus counter |
+| Drop ratio at the Dispatcher | **~69%** of accepted events never fanned out | derived |
+| Producer:consumer throughput gap | **2.9×** | 568 / 196 |
+| `journey_enrollments` rows written | matches `campaign_dispatched_total` exactly | end-of-run `make enrollments-count` |
+
+### Named bottleneck: the single Dispatcher consumer goroutine
+
+V1's Dispatcher is one goroutine reading from a 1024-deep buffered
+channel. Per event it does — *serially* —
+
+1. `MySQL: campaigns.ListByWorkspace(workspace_id)` (no cache)
+2. `MySQL: people.Get(workspace_id, person_id)`
+3. Decode trigger + evaluate against the inbound event
+4. `text/template` render
+5. `HTTP POST` to `stub-receiver` (sync, 5 s timeout)
+6. `MySQL: INSERT INTO journey_enrollments`
+
+Four DB hops + one outbound HTTP per event, single-threaded. Per-event
+budget on this hardware lands at ~5 ms ⇒ ceiling near **200 events/s on
+the fan-out path**. The intake path (handler + person ensure + events
+insert + 202 to client) keeps up at 568 events/s — so the producer
+outruns the consumer by ~2.9×, the 1024-deep buffer fills in roughly 3
+seconds, and from that point the producer drops 69% of events to the
+`campaign_queue_dropped_total` counter while the client keeps seeing 202s.
+
+In production this is a silent dataloss bug. In V1 it's the deliberate
+bottleneck V2 was always going to remove.
+
+### What V2 changes
+
+| V2 PR | Mechanism | Bottleneck removed |
+|---|---|---|
+| **V2-1** | RabbitMQ async fan-out + parallel render workers + per-workspace queue admission | Single consumer goroutine (this section). Replaces the 1024-deep in-process channel with durable, persisted queues; replaces the lone consumer with N workers. |
+| **V2-2** | Roaring bitmaps with incremental segment maintenance (`RoaringBitmap/roaring` upstream) | Per-event `ListByWorkspace` scan + the scan-based segment evaluator (BM‑33, BM‑36). |
+| **V2-3** | Idempotency keys + two-phase dispatch (`sending` → ack → `sent`) | Audit-failure-doesn't-reverse-dispatch gap (BM‑78). Retries become safe. |
+
+V2's expected new ceiling once the consumer parallelizes: **render CPU
+per workspace** and bitmap memory accounting. We'll re-run the same load
+driver and re-measure.
+
+
 
 | URL | What |
 |---|---|
@@ -99,7 +181,7 @@ behavioral-messaging/
 ├── deploy/                         Build 5 carryover — collector/tempo/prom/loki/alloy/grafana
 │   └── grafana/provisioning/dashboards/ — red.json + use.json (panels TBD-rewritten for MySQL)
 ├── migrations/                     001_v1.sql (workspaces, people, events, journey_enrollments, idempotency_keys) · 002_segments.sql · 003_campaigns.sql
-└── chaos/                          load + chaos scripts (added next PR)
+└── chaos/                          load-v1.sh — bash+curl V1 driver (Go loadgen lands in V2)
 ```
 
 ## Why these decisions
@@ -129,8 +211,9 @@ or log shipping. Day-1 dashboards.
 
 | Version | Theme | Scope |
 |---|---|---|
-| `v0.1.0-foundation` | V1 PR 1 (this commit) | Scaffold + Track API + stub receiver + MySQL + observability drop-in |
-| `v0.1.x` | V1 PRs 2-5 | Person store + segment evaluation (scan) + campaign worker + load driver + load-test writeup |
+| `v0.1.0-foundation` | V1 PR 1 | Scaffold + Track API + stub receiver + MySQL + observability drop-in |
+| `v0.1.x` | V1 PRs 2-4 | Person store · segment evaluation (scan) · campaign trigger + in-process Dispatcher |
+| `v0.1.5-ceiling` | V1 PR 5 (this commit) | Load driver + V1 ceiling writeup (see [§ V1 ceiling](#v1-ceiling-on-this-hardware)). Bottleneck named: single Dispatcher consumer, 2.9× producer-consumer gap, ~69% drop rate at the soak rate. |
 | `v0.2.0-throughput` | V2 | RabbitMQ fan-out · roaring bitmaps · idempotency keys |
 | `v0.3.0-durability` | V3 | Journey FSM · DLQs · per-workspace queue isolation (implementation or design-doc-only depending on interview timing) |
 

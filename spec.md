@@ -2,7 +2,7 @@
 
 | Field   | Value         |
 |---------|---------------|
-| Version | 0.1.4 (V1)    |
+| Version | 0.1.5 (V1 closed) |
 | Author  | Steve Weiland |
 | Date    | 2026-05-20    |
 | Status  | Draft         |
@@ -156,9 +156,49 @@ Requirements use [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) keywords:
 
 ### 3.2 V2 — Throughput
 
-*Drafted in PR 2's spec bump. Three mechanism subsections: RabbitMQ async
-fan-out, roaring bitmaps with incremental segment maintenance, idempotency
-keys + two-phase dispatch.*
+V1 PR 5 measured the V1 ceiling on the reference hardware (Apple M4 Max,
+36 GB, macOS 15.7.3; one `track-api` replica, single MySQL, in-process
+Dispatcher). See [README § V1 ceiling](./README.md#v1-ceiling-on-this-hardware)
+for the run config and Grafana excerpts. Headline finding:
+
+- **Intake (HTTP → MySQL `events`):** ~568 events/s sustained at concurrency=20, zero failures.
+- **Fan-out (Dispatcher consumer):** ~196 events/s steady-state.
+- **Drop rate at the in-process channel:** ~69% during the soak.
+- **Named bottleneck:** the single Dispatcher consumer goroutine doing four serial MySQL hops + one sync HTTP per event.
+
+V2 closes that gap in three mechanism PRs, each one an interview answer
+with metrics from the same load driver re-run.
+
+#### 3.2.1 V2-1 — RabbitMQ async fan-out (BM‑80..89)
+
+The in-process `chan job` becomes a durable RabbitMQ queue; the lone
+consumer goroutine becomes a worker pool. This is the load-bearing PR —
+it removes the V1 ceiling directly.
+
+| ID | Requirement |
+|----|-------------|
+| `BM‑80` | The Dispatcher **MUST** publish each accepted event to a RabbitMQ exchange (`campaigns.fanout`) keyed by `workspace_id`. The producer-side `Submit(ctx, ev)` API **MUST NOT** change — V1's call site in `/events` is unchanged. |
+| `BM‑81` | A new `cmd/campaign-worker/` service **MUST** consume from per-workspace queues bound to `campaigns.fanout`. Default deployment: one worker container, configurable concurrency (`PREFETCH`, default 32). Multiple replicas **MUST** be safe (queues are competing-consumer; ack only after dispatch + audit). |
+| `BM‑82` | Per-workspace queue admission **MUST** be in place from V2-1, not deferred to V3. Concretely: one queue per workspace, named `campaigns.fanout.<workspace_id>`, bound to the exchange with `routing_key=<workspace_id>`. Per-workspace queue depth + processing rate **MUST** surface as Prometheus counters attributed by `workspace_id`. |
+| `BM‑83` | Messages **MUST** be persistent (`delivery_mode=2`) and the queue **MUST** be durable. RabbitMQ restarts **MUST NOT** drop accepted events. |
+| `BM‑84` | Worker acks **MUST** be manual: ack only after `journey_enrollments` is written. nack-with-requeue on transient failure (MySQL connection error, stub timeout); reject-without-requeue on terminal failure (template render error, decode error). |
+| `BM‑85` | A DLQ (`campaigns.fanout.dlx`) **MUST** be wired but acceptably empty in V2-1. V3-2 introduces real retry-with-backoff semantics; V2-1 just establishes the topology so V3-2 is a config change, not a refactor. |
+| `BM‑86` | `campaign_queue_dropped_total` from V1 **MUST** be retired; in V2 the producer never drops — the broker provides backpressure. A new `campaign_queue_depth{workspace_id}` gauge replaces it. |
+| `BM‑87` | The new V2 ceiling **MUST** be measured with the same `chaos/load-v1.sh` driver re-run on the same hardware. Expected new bottleneck per BM‑88. |
+| `BM‑88` | The V2-1 writeup **MUST** name the new bottleneck. Expected candidates: render CPU on the worker; MySQL connection-pool contention from N parallel workers; broker publish throughput. |
+| `BM‑89` | The producer (`/events` handler) **MUST** continue to respond ≤ 1 hop after `eventstore.Insert` returns — broker publish runs in a goroutine with bounded retry, never blocks the HTTP reply. (This preserves V1's intake-throughput characteristic; the goal of V2 is to grow the fan-out rate, not slow the intake.) |
+
+#### 3.2.2 V2-2 — Roaring bitmaps for segment evaluation (BM‑90..99)
+
+*Drafted at V2-2 PR time. Maps to interview question: "Scale segment
+evaluation to 10M users." Upstream `github.com/RoaringBitmap/roaring`,
+not from-scratch primitives (Q4).*
+
+#### 3.2.3 V2-3 — Idempotency keys + two-phase dispatch (BM‑100..109)
+
+*Drafted at V2-3 PR time. Maps to interview question: "Guarantee
+exactly-once email delivery." Closes the audit-failure-doesn't-reverse-
+dispatch gap from BM‑78.*
 
 ### 3.3 V3 — Durability
 
@@ -378,3 +418,4 @@ bottleneck-migration narrative with hardware-pinned numbers.
 | 0.1.2   | 2026-05-21 | Steve Weiland | V1 PR 3: segment store + scan-based evaluator. `BM‑30..38` added — six-op condition tree (and/or/not/attr_eq/attr_exists/event_seen), depth cap 8, structural JSON equality. `Condition` API will be reused by the V1 PR 4 campaign trigger. §4 I/O surface gains `/segments` + check endpoint. Q10–Q11 resolved (scan-based V1, V2 swaps to bitmaps). |
 | 0.1.3   | 2026-05-21 | Steve Weiland | V1 PR 4: campaign trigger + in-process fan-out. `BM‑70..79` added — `POST/GET /campaigns`, `Dispatcher` (buffered channel + single consumer goroutine, drop-on-full with Prometheus counter, async `campaign.process` span joined to the producer trace), trigger reuses `segment.Condition` verbatim with a single-event `EvalContext` (so `event_seen` matches the inbound event), Go `text/template` rendering with `missingkey=zero`, `journey_enrollments` audit insert per dispatch. The kickoff-PR direct `forwardToStub` smoke path is now routed through the Dispatcher's `dispatch` HTTP call. §4 I/O surface gains `/campaigns`. |
 | 0.1.4   | 2026-05-21 | Steve Weiland | Spelling sweep: British → American. Schema rename `journey_enrolments` → `journey_enrollments`, column `enrolment_id` → `enrollment_id`, indexes `idx_enrolments_*` → `idx_enrollments_*` (`enrolled_at` kept — past-tense spelling is identical in both dialects). Go identifiers `EnrolmentID`/`enrolID`/`insertEnrolment` retitled. Prose `behaviour`/`behavioural`/`enrol(s)` retitled across spec/README/comments. No behavior change; live MySQL needs a one-time `RENAME TABLE` (or `make down -v && make up` reset). |
+| 0.1.5   | 2026-05-21 | Steve Weiland | V1 PR 5 closes V1: `chaos/load-v1.sh` (bash+curl closed-loop driver, `make load-{prep,quick,soak}`); soak measured 568 events/s intake, ~196 events/s fan-out, ~69% drop at the in-process channel. Bottleneck named: single Dispatcher consumer doing four serial MySQL hops + one sync HTTP per event. §3.2 V2 — Throughput rewritten: V2-1 RabbitMQ async fan-out spelled out as `BM‑80..89` (per-workspace queues from day 1, durable + manual-ack, DLQ topology established, V2-1 writeup names the new ceiling); V2-2 + V2-3 stubbed for their PR time. README gains the V1 ceiling section with hardware banner. |

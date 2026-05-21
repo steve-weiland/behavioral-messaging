@@ -3,6 +3,7 @@
 COMPOSE ?= docker compose
 
 .PHONY: help up down logs ps rebuild test seed seed-people seed-segments seed-campaign \
+	load-prep load-quick load-soak \
 	mysql events-count people-count segments-count campaigns-count enrollments-count
 
 help:
@@ -25,6 +26,15 @@ rebuild: ## Rebuild + restart Go services only
 
 test: ## Run all Go unit tests (no docker required)
 	go test ./...
+
+load-prep: ## Pre-seed welcome_pro + 50 plan=pro people for load runs
+	WORKSPACE=ws_alpha PEOPLE=50 DURATION=0 ./chaos/load-v1.sh
+
+load-quick: ## 10s burst @ concurrency=5 (sanity)
+	WORKSPACE=ws_alpha PEOPLE=50 DURATION=10 CONCURRENCY=5 ./chaos/load-v1.sh
+
+load-soak: ## 60s steady @ concurrency=20 (ceiling search — V1 writeup data)
+	WORKSPACE=ws_alpha PEOPLE=50 DURATION=60 CONCURRENCY=20 ./chaos/load-v1.sh
 
 seed: ## POST 10 events at 1 req/s
 	@for i in 1 2 3 4 5 6 7 8 9 10; do \
