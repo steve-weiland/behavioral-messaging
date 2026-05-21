@@ -15,7 +15,7 @@ changed, what now breaks" writeup with hardware-pinned measurements.
 | | |
 |--|--|
 | **Spec** | [`spec.md`](./spec.md) — RFC-2119 V1 + V2 + V3 requirements |
-| **Status** | `v0.1.0-foundation-complete`. Six V1 surfaces shipped — Track API, person store, segment store + scan eval, campaign trigger + in-process Dispatcher, stub receiver, full observability scaffold. V1 load-test run on 2026-05-21 — see [§ V1 ceiling](#v1-ceiling-on-this-hardware). |
+| **Status** | `v0.1.5-foundation-complete`. Six V1 surfaces shipped — Track API, person store, segment store + scan eval, campaign trigger + in-process Dispatcher, stub receiver, full observability scaffold. V1 load-test run on 2026-05-21 — see [§ V1 ceiling](#v1-ceiling-on-this-hardware). |
 | **Stack** | Go 1.25 · MySQL 8.0 · OpenTelemetry SDK + Collector 0.151 · Tempo 2.10 · Prometheus 3.11 · Loki 3.7 · Grafana Alloy v1.16 · Grafana 13.0 · `docker compose` |
 
 ---

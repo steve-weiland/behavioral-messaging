@@ -90,21 +90,21 @@ func NewDispatcher(db *sql.DB, hc *http.Client, stubURL string) *Dispatcher {
 	}
 }
 
-// Start spins up the single consumer goroutine. Pass the service's root
-// context so the consumer drains its in-flight job on SIGTERM.
-func (d *Dispatcher) Start(rootCtx context.Context) {
+// Start spins up the single consumer goroutine. The dispatcher's
+// lifecycle is bounded by Stop() — not by any context — so that events
+// submitted *during* HTTP graceful shutdown (handlers in-flight after
+// SIGTERM but before httpServer.Shutdown returns) still get drained.
+// Call order in main must be: httpServer.Shutdown(stopCtx); then Stop().
+func (d *Dispatcher) Start() {
 	d.wg.Add(1)
 	go func() {
 		defer d.wg.Done()
 		for {
 			select {
-			case j, ok := <-d.ch:
-				if !ok {
-					return
-				}
+			case j := <-d.ch:
 				d.process(j.parentCtx, j.event)
-			case <-rootCtx.Done():
-				// Drain whatever's already in the channel — bounded by buffer size.
+			case <-d.done:
+				// Drain whatever's already in the channel, then exit.
 				for {
 					select {
 					case j := <-d.ch:
@@ -113,14 +113,12 @@ func (d *Dispatcher) Start(rootCtx context.Context) {
 						return
 					}
 				}
-			case <-d.done:
-				return
 			}
 		}
 	}()
 }
 
-// Stop closes the queue and waits for the consumer to drain.
+// Stop signals shutdown and waits for the consumer to drain.
 // Idempotent — safe to call from a defer.
 func (d *Dispatcher) Stop() {
 	select {
@@ -132,9 +130,13 @@ func (d *Dispatcher) Stop() {
 	d.wg.Wait()
 }
 
-// Submit queues one event for campaign processing. Drops the event (and
-// increments queueDropped) if the buffer is full. parentCtx carries the
-// producer's span context so the consumer's span joins the trace.
+// Submit queues one event for campaign processing. Three outcomes:
+//   - dispatcher stopping (d.done closed) → drop + count
+//   - buffer has room                     → queue
+//   - buffer full                         → drop + count
+//
+// parentCtx carries the producer's span context so the consumer's span
+// joins the trace; reqCtx is kept for metric + log attribution only.
 func (d *Dispatcher) Submit(reqCtx context.Context, ev event.Event) {
 	// Detach from the request context so the consumer can outlive the
 	// HTTP handler. Trace context is preserved by re-attaching the span.
@@ -143,6 +145,15 @@ func (d *Dispatcher) Submit(reqCtx context.Context, ev event.Event) {
 		trace.SpanContextFromContext(reqCtx),
 	)
 	select {
+	case <-d.done:
+		// Dispatcher is stopping; don't queue an event that may never be
+		// drained. Surface the drop on the same counter the buffer-full
+		// path uses — both are "event accepted at HTTP but never fanned out."
+		d.queueDropped.Add(reqCtx, 1,
+			metric.WithAttributes(attribute.String("workspace_id", ev.WorkspaceID)))
+		slog.WarnContext(reqCtx, "campaign dispatcher stopping — dropping event",
+			slog.String("workspace_id", ev.WorkspaceID),
+			slog.String("event_id", ev.EventID))
 	case d.ch <- job{parentCtx: parent, event: ev}:
 		// queued
 	default:

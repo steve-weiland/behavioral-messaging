@@ -2,7 +2,7 @@
 
 COMPOSE ?= docker compose
 
-.PHONY: help up down logs ps rebuild test seed seed-people seed-segments seed-campaign \
+.PHONY: help up down logs ps rebuild test seed seed-people seed-segments seed-campaign showcase \
 	load-prep load-quick load-soak \
 	mysql events-count people-count segments-count campaigns-count enrollments-count
 
@@ -35,6 +35,12 @@ load-quick: ## 10s burst @ concurrency=5 (sanity)
 
 load-soak: ## 60s steady @ concurrency=20 (ceiling search — V1 writeup data)
 	WORKSPACE=ws_alpha PEOPLE=50 DURATION=60 CONCURRENCY=20 ./chaos/load-v1.sh
+
+showcase: ## Run every V1 surface end-to-end (people → segment → campaign → 10 events) — BM-52
+	@$(MAKE) -s seed-people
+	@$(MAKE) -s seed-segments
+	@$(MAKE) -s seed-campaign
+	@$(MAKE) -s seed
 
 seed: ## POST 10 events at 1 req/s
 	@for i in 1 2 3 4 5 6 7 8 9 10; do \
@@ -79,10 +85,12 @@ enrollments-count: ## SELECT count(*) FROM journey_enrollments
 	$(COMPOSE) exec -T mysql mysql -ubm -pbm bm -e 'SELECT count(*) FROM journey_enrollments;'
 
 seed-segments: ## Define active_pro + two people + check membership before/after event (V1 PR 3)
-	@echo "1. define active_pro = plan=pro AND viewed_pricing"
-	@curl -fsS -X POST -H 'Content-Type: application/json' -H 'X-Workspace-ID: ws_alpha' \
-		-d '{"segment_id":"active_pro","name":"Active pro users","definition":{"op":"and","conditions":[{"op":"attr_eq","key":"plan","value":"pro"},{"op":"event_seen","name":"viewed_pricing"}]}}' \
-		http://localhost:8090/segments && echo
+	@echo "1. ensure active_pro = plan=pro AND viewed_pricing (idempotent)"
+	@if ! curl -fsS -H 'X-Workspace-ID: ws_alpha' http://localhost:8090/segments/active_pro > /dev/null 2>&1; then \
+		curl -fsS -X POST -H 'Content-Type: application/json' -H 'X-Workspace-ID: ws_alpha' \
+			-d '{"segment_id":"active_pro","name":"Active pro users","definition":{"op":"and","conditions":[{"op":"attr_eq","key":"plan","value":"pro"},{"op":"event_seen","name":"viewed_pricing"}]}}' \
+			http://localhost:8090/segments && echo "   created"; \
+	else echo "   already exists"; fi
 	@echo
 	@echo "2. identify p_alice (plan=pro) and p_bob (plan=free)"
 	@curl -fsS -X POST -H 'Content-Type: application/json' -H 'X-Workspace-ID: ws_alpha' \
@@ -105,10 +113,12 @@ seed-segments: ## Define active_pro + two people + check membership before/after
 	@printf "  bob:   "; curl -fsS -H 'X-Workspace-ID: ws_alpha' 'http://localhost:8090/segments/active_pro/check?person_id=p_bob'; echo
 
 seed-campaign: ## Define welcome_pro + identify two people + fire signed_up + verify enrollments (V1 PR 4)
-	@echo "1. define welcome_pro = (plan=pro AND event_seen signed_up) → templated welcome message"
-	@curl -fsS -X POST -H 'Content-Type: application/json' -H 'X-Workspace-ID: ws_alpha' \
-		-d '{"campaign_id":"welcome_pro","name":"Welcome Pro users","trigger":{"op":"and","conditions":[{"op":"attr_eq","key":"plan","value":"pro"},{"op":"event_seen","name":"signed_up"}]},"template":"Welcome {{.Person.PersonID}} — your {{.Attrs.plan}} plan is live."}' \
-		http://localhost:8090/campaigns && echo
+	@echo "1. ensure welcome_pro = (plan=pro AND event_seen signed_up) (idempotent)"
+	@if ! curl -fsS -H 'X-Workspace-ID: ws_alpha' http://localhost:8090/campaigns/welcome_pro > /dev/null 2>&1; then \
+		curl -fsS -X POST -H 'Content-Type: application/json' -H 'X-Workspace-ID: ws_alpha' \
+			-d '{"campaign_id":"welcome_pro","name":"Welcome Pro users","trigger":{"op":"and","conditions":[{"op":"attr_eq","key":"plan","value":"pro"},{"op":"event_seen","name":"signed_up"}]},"template":"Welcome {{.Person.PersonID}} — your {{.Attrs.plan}} plan is live."}' \
+			http://localhost:8090/campaigns && echo "   created"; \
+	else echo "   already exists"; fi
 	@echo
 	@echo "2. identify pr4a (plan=pro) and pr4b (plan=free)"
 	@curl -fsS -X POST -H 'Content-Type: application/json' -H 'X-Workspace-ID: ws_alpha' \

@@ -21,10 +21,13 @@ import (
 )
 
 // Body-size caps. Worked out per surface; documented as BM-26 (people),
-// BM-30 (segments), BM-70/72 (campaigns).
+// BM-30 (segments), BM-70/72 (campaigns). BM-20 (events) cap is the same
+// 32 KiB as campaigns — the payload is an arbitrary JSON object and a
+// few KiB of structured business data is reasonable.
 const (
 	maxAttributesBytes    = 16 * 1024
 	maxSegmentDefBytes    = 16 * 1024
+	maxEventBodyBytes     = 32 * 1024
 	segmentScanEventLimit = 1000
 	maxCampaignBodyBytes  = 32 * 1024
 	maxTemplateBytes      = 16 * 1024
@@ -103,7 +106,7 @@ func (s *server) handlePeoplePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	workspace := r.Header.Get("X-Workspace-ID")
-	if !validID(workspace) {
+	if !validShortID(workspace) {
 		writeErr(w, http.StatusBadRequest, "X-Workspace-ID required ([A-Za-z0-9_-]{1,64})")
 		return
 	}
@@ -117,7 +120,7 @@ func (s *server) handlePeoplePost(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	if !validID(req.PersonID) {
+	if !validLongID(req.PersonID) {
 		writeErr(w, http.StatusBadRequest, "person_id required ([A-Za-z0-9_-]{1,128})")
 		return
 	}
@@ -152,12 +155,12 @@ func (s *server) handlePeopleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	workspace := r.Header.Get("X-Workspace-ID")
-	if !validID(workspace) {
+	if !validShortID(workspace) {
 		writeErr(w, http.StatusBadRequest, "X-Workspace-ID required ([A-Za-z0-9_-]{1,64})")
 		return
 	}
 	personID := strings.TrimPrefix(r.URL.Path, "/people/")
-	if !validID(personID) {
+	if !validLongID(personID) {
 		writeErr(w, http.StatusBadRequest, "person_id path segment required")
 		return
 	}
@@ -185,7 +188,7 @@ func (s *server) handleSegmentsPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	workspace := r.Header.Get("X-Workspace-ID")
-	if !validID(workspace) {
+	if !validShortID(workspace) {
 		writeErr(w, http.StatusBadRequest, "X-Workspace-ID required ([A-Za-z0-9_-]{1,64})")
 		return
 	}
@@ -199,7 +202,7 @@ func (s *server) handleSegmentsPost(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	if !validID(req.SegmentID) {
+	if !validShortID(req.SegmentID) {
 		writeErr(w, http.StatusBadRequest, "segment_id required ([A-Za-z0-9_-]{1,64})")
 		return
 	}
@@ -252,13 +255,13 @@ func (s *server) handleSegmentsGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	workspace := r.Header.Get("X-Workspace-ID")
-	if !validID(workspace) {
+	if !validShortID(workspace) {
 		writeErr(w, http.StatusBadRequest, "X-Workspace-ID required ([A-Za-z0-9_-]{1,64})")
 		return
 	}
 	suffix := strings.TrimPrefix(r.URL.Path, "/segments/")
 	segmentID, remainder, _ := strings.Cut(suffix, "/")
-	if !validID(segmentID) {
+	if !validShortID(segmentID) {
 		writeErr(w, http.StatusBadRequest, "segment_id path segment required")
 		return
 	}
@@ -284,13 +287,14 @@ func (s *server) handleSegmentsGet(w http.ResponseWriter, r *http.Request) {
 		return
 	case "check":
 		personID := r.URL.Query().Get("person_id")
-		if !validID(personID) {
+		if !validLongID(personID) {
 			writeErr(w, http.StatusBadRequest, "person_id query parameter required")
 			return
 		}
 		p, err := person.Get(r.Context(), s.db, workspace, personID)
 		if errors.Is(err, person.ErrNotFound) {
 			// A person that doesn't exist is, by definition, not a member.
+			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(segmentCheckResponse{
 				WorkspaceID: workspace, SegmentID: segmentID, PersonID: personID, Member: false,
 			})
@@ -349,7 +353,7 @@ func (s *server) handleCampaignsPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	workspace := r.Header.Get("X-Workspace-ID")
-	if !validID(workspace) {
+	if !validShortID(workspace) {
 		writeErr(w, http.StatusBadRequest, "X-Workspace-ID required ([A-Za-z0-9_-]{1,64})")
 		return
 	}
@@ -363,7 +367,7 @@ func (s *server) handleCampaignsPost(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	if !validID(req.CampaignID) {
+	if !validShortID(req.CampaignID) {
 		writeErr(w, http.StatusBadRequest, "campaign_id required ([A-Za-z0-9_-]{1,64})")
 		return
 	}
@@ -422,12 +426,12 @@ func (s *server) handleCampaignsGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	workspace := r.Header.Get("X-Workspace-ID")
-	if !validID(workspace) {
+	if !validShortID(workspace) {
 		writeErr(w, http.StatusBadRequest, "X-Workspace-ID required ([A-Za-z0-9_-]{1,64})")
 		return
 	}
 	campaignID := strings.TrimPrefix(r.URL.Path, "/campaigns/")
-	if !validID(campaignID) {
+	if !validShortID(campaignID) {
 		writeErr(w, http.StatusBadRequest, "campaign_id path segment required")
 		return
 	}
@@ -454,20 +458,25 @@ func (s *server) handleEventsPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	workspace := r.Header.Get("X-Workspace-ID")
-	if !validID(workspace) {
+	if !validShortID(workspace) {
 		writeErr(w, http.StatusBadRequest, "X-Workspace-ID required ([A-Za-z0-9_-]{1,64})")
 		return
 	}
+	body, err := readBody(r, maxEventBodyBytes)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	var req intakeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(body, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	if !validID(req.PersonID) {
+	if !validLongID(req.PersonID) {
 		writeErr(w, http.StatusBadRequest, "person_id required ([A-Za-z0-9_-]{1,128})")
 		return
 	}
-	if !validEventName(req.EventName) {
+	if !validLongID(req.EventName) {
 		writeErr(w, http.StatusBadRequest, "event_name required ([A-Za-z0-9_-]{1,128})")
 		return
 	}
@@ -529,8 +538,16 @@ func writeErr(w http.ResponseWriter, code int, msg string) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
-func validID(s string) bool {
-	if s == "" || len(s) > 128 {
+// validShortID — IDs backed by VARCHAR(64) columns: workspace_id,
+// segment_id, campaign_id. Spec error messages quote ([A-Za-z0-9_-]{1,64}).
+func validShortID(s string) bool { return validIDWithMax(s, 64) }
+
+// validLongID — IDs backed by VARCHAR(128) columns: person_id, event_name.
+// Spec error messages quote ([A-Za-z0-9_-]{1,128}).
+func validLongID(s string) bool { return validIDWithMax(s, 128) }
+
+func validIDWithMax(s string, max int) bool {
+	if s == "" || len(s) > max {
 		return false
 	}
 	for _, c := range s {
@@ -545,8 +562,6 @@ func validID(s string) bool {
 	}
 	return true
 }
-
-func validEventName(s string) bool { return validID(s) }
 
 // readBody reads up to max+1 bytes; rejects if over max.
 func readBody(r *http.Request, max int) (json.RawMessage, error) {

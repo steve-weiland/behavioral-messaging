@@ -45,9 +45,9 @@ func main() {
 	rootCtx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	slog.SetDefault(logsx.Init(serviceName, "0.1.0"))
+	slog.SetDefault(logsx.Init(serviceName, "0.1.5"))
 
-	shutdownTrace, err := otelinit.Init(rootCtx, serviceName, "0.1.0")
+	shutdownTrace, err := otelinit.Init(rootCtx, serviceName, "0.1.5")
 	if err != nil {
 		log.Fatalf("otel init: %v", err)
 	}
@@ -69,7 +69,7 @@ func main() {
 	// buffered channel, drop-on-full with a Prometheus counter. V2
 	// replaces the channel with RabbitMQ; the Dispatcher API stays.
 	dispatcher := campaign.NewDispatcher(db, httpClient, stubURL)
-	dispatcher.Start(rootCtx)
+	dispatcher.Start()
 	defer dispatcher.Stop()
 
 	srv := newServer(db, dispatcher, stubURL)

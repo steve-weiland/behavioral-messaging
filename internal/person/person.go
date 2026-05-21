@@ -48,12 +48,13 @@ func EnsureExists(ctx context.Context, db *sql.DB, workspaceID, personID string)
 // Upsert merges `attrs` into the row's existing JSON attributes via
 // JSON_MERGE_PATCH (RFC 7396). On first insert the new attributes are
 // stored verbatim; on subsequent calls they merge with previous state.
-// updated_at is refreshed in both cases.
 //
 // `attrs` is passed as a raw JSON object (the body the caller already
-// validated). Passing an empty object is allowed and amounts to "touch
-// updated_at," which the function does NOT do — empty merges are a no-op
-// at the SQL layer.
+// validated). MySQL evaluates the ON DUPLICATE KEY UPDATE clause on
+// every collision; if `attrs` is `{}` the JSON_MERGE_PATCH leaves the
+// stored attributes byte-identical, but `updated_at = CURRENT_TIMESTAMP`
+// still bumps the timestamp. Callers wanting strict no-op idempotency
+// should send the canonical empty path themselves.
 func Upsert(ctx context.Context, db *sql.DB, workspaceID, personID string, attrs json.RawMessage) error {
 	const q = `
 		INSERT INTO people (workspace_id, person_id, attributes)

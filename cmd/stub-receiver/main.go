@@ -34,9 +34,9 @@ func main() {
 	rootCtx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	slog.SetDefault(logsx.Init(serviceName, "0.1.0"))
+	slog.SetDefault(logsx.Init(serviceName, "0.1.5"))
 
-	shutdownTrace, err := otelinit.Init(rootCtx, serviceName, "0.1.0")
+	shutdownTrace, err := otelinit.Init(rootCtx, serviceName, "0.1.5")
 	if err != nil {
 		log.Fatalf("otel init: %v", err)
 	}
@@ -48,6 +48,13 @@ func main() {
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Catch-all path — reject anything that isn't a POST so stray
+		// GETs (healthchecks, scanners, prefetchers) don't pollute the
+		// delivery-received log with false positives.
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
 		body, err := io.ReadAll(io.LimitReader(r.Body, 64*1024))
 		if err != nil {
 			http.Error(w, `{"error":"read body"}`, http.StatusBadRequest)
