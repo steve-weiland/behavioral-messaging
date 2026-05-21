@@ -33,6 +33,7 @@ import (
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
+	"github.com/steveweiland/behavioral-messaging/internal/amqpx"
 	"github.com/steveweiland/behavioral-messaging/internal/campaign"
 	"github.com/steveweiland/behavioral-messaging/internal/eventstore"
 	"github.com/steveweiland/behavioral-messaging/internal/logsx"
@@ -65,8 +66,27 @@ func main() {
 		Transport: otelhttp.NewTransport(http.DefaultTransport),
 	}
 
+	// V2-1a: connect to RabbitMQ and declare the producer-side topology
+	// (campaigns.fanout exchange + DLX + DLQ). Per-workspace queues are
+	// declared by the worker (V2-1b). The connection is kept open for
+	// V2-1b's Publish path; in V2-1a it just proves the broker is wired.
+	amqpURL := envOr("AMQP_URL", "amqp://guest:guest@rabbitmq:5672/")
+	amqpConn, amqpCh, err := amqpx.ConnectWithRetry(amqpURL, 30*time.Second)
+	if err != nil {
+		log.Fatalf("amqp connect: %v", err)
+	}
+	defer amqpConn.Close()
+	defer amqpCh.Close()
+	if err := campaign.DeclareProducerTopology(amqpCh); err != nil {
+		log.Fatalf("amqp topology: %v", err)
+	}
+	slog.Info("amqp topology declared",
+		slog.String("exchange", campaign.ExchangeFanout),
+		slog.String("dlx", campaign.ExchangeDLX),
+		slog.String("dlq", campaign.QueueDLQ))
+
 	// V1 PR 4: in-process campaign fan-out. Single consumer goroutine,
-	// buffered channel, drop-on-full with a Prometheus counter. V2
+	// buffered channel, drop-on-full with a Prometheus counter. V2-1b
 	// replaces the channel with RabbitMQ; the Dispatcher API stays.
 	dispatcher := campaign.NewDispatcher(db, httpClient, stubURL)
 	dispatcher.Start()

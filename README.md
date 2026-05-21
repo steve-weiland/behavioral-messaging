@@ -136,6 +136,7 @@ driver and re-measure.
 | `GET  http://localhost:8090/segments/<id>/check?person_id=<pid>` | Scan-eval membership for one person. V2's bitmap path removes the scan. *(V1 PR 3)* |
 | `POST http://localhost:8090/campaigns` | Define a campaign — trigger (same condition tree as segments) + Go `text/template` body. Validates at insert time. *(V1 PR 4)* |
 | `GET  http://localhost:8090/campaigns/<id>` | Read the stored campaign. *(V1 PR 4)* |
+| http://localhost:15672 (guest/guest) | RabbitMQ management UI — `campaigns.fanout` exchange, `campaigns.fanout.dlx` DLX, `campaigns.fanout.dlq` DLQ declared at track-api startup. *(V2 PR 6)* |
 | http://localhost:8091/healthz | `stub-receiver` (V1) — receives the rendered template per dispatched campaign |
 | http://localhost:3030/explore | Grafana — Tempo / Prometheus / Loki datasources provisioned. Try `{resource.service.name="track-api"}` in Tempo Search. |
 | http://localhost:3030/d/obs-red | RED dashboard (carried from Build 5). V1 panels populate once traffic flows. |
@@ -150,6 +151,7 @@ driver and re-measure.
 | `track-api` | `:8090` | container `:8080`; host `8080` squatted |
 | `stub-receiver` | `:8091` | container `:8081` |
 | MySQL | `:3307` | container `:3306`; host `:3306` left for any local MySQL |
+| RabbitMQ | `:5672` (AMQP), `:15672` (mgmt), `:15692` (Prom) | guest/guest creds; mgmt UI in browser |
 | OTel collector | `:4317` | OTLP/gRPC; Prom scrape `:8889` |
 | Tempo | `:3200` | |
 | Prometheus | `:9090` | |
@@ -174,9 +176,11 @@ behavioral-messaging/
 │   ├── eventstore/                 MySQL persistence (sql.Open in V1, otelsql follow-up)
 │   ├── otelinit/                   Build 5 carryover — TracerProvider + MeterProvider
 │   ├── logsx/                      Build 5 carryover — slog JSON + trace_id/span_id
+│   ├── amqpx/                      V2 PR 6 — thin amqp091 wrapper (Connect/Publish/Consume + traceparent propagation)
 │   ├── person/                     V1.x — person store
 │   ├── segment/                    V1.x — condition tree parser; V2 — roaring bitmap engine
-│   ├── campaign/                   V1 PR 4 — trigger eval + Go text/template render + Dispatcher (in-process channel + 1 consumer goroutine)
+│   ├── campaign/                   V1 PR 4 — trigger eval + Go text/template render + Dispatcher (in-process channel + 1 consumer goroutine).
+│   │                               V2 PR 6 — topology.go (RabbitMQ exchange + DLX + DLQ declarations for V2-1)
 │   └── journey/                    V3 — FSM with delays
 ├── deploy/                         Build 5 carryover — collector/tempo/prom/loki/alloy/grafana
 │   └── grafana/provisioning/dashboards/ — red.json + use.json (panels TBD-rewritten for MySQL)
@@ -213,8 +217,9 @@ or log shipping. Day-1 dashboards.
 |---|---|---|
 | `v0.1.0-foundation` | V1 PR 1 | Scaffold + Track API + stub receiver + MySQL + observability drop-in |
 | `v0.1.x` | V1 PRs 2-4 | Person store · segment evaluation (scan) · campaign trigger + in-process Dispatcher |
-| `v0.1.5-ceiling` | V1 PR 5 (this commit) | Load driver + V1 ceiling writeup (see [§ V1 ceiling](#v1-ceiling-on-this-hardware)). Bottleneck named: single Dispatcher consumer, 2.9× producer-consumer gap, ~69% drop rate at the soak rate. |
-| `v0.2.0-throughput` | V2 | RabbitMQ fan-out · roaring bitmaps · idempotency keys |
+| `v0.1.5-ceiling` | V1 PR 5 (tagged) | Load driver + V1 ceiling writeup (see [§ V1 ceiling](#v1-ceiling-on-this-hardware)). Bottleneck named: single Dispatcher consumer, 2.9× producer-consumer gap, ~69% drop rate at the soak rate. |
+| `v0.1.6-amqp` | V2 PR 6 (this commit) | RabbitMQ infra + `internal/amqpx/` + `campaigns.fanout` topology declared at track-api startup. Dispatch path unchanged — broker is wired but unused until V2 PR 7. |
+| `v0.2.0-throughput` | V2 PRs 7-8 | Dispatcher publishes to RabbitMQ · new `cmd/campaign-worker/` consumes per-workspace queues with manual ack · V2 ceiling measured + writeup |
 | `v0.3.0-durability` | V3 | Journey FSM · DLQs · per-workspace queue isolation (implementation or design-doc-only depending on interview timing) |
 
 ## Reading

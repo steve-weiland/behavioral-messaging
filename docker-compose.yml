@@ -1,20 +1,34 @@
-# Behavioral Messaging Platform — V1 compose.
+# Behavioral Messaging Platform — V2 compose.
 #
-# V1 cuts RabbitMQ entirely (in-process channel fan-out) and uses
-# MySQL 8.0 (Customer.io-aligned, CV-gap-filling). Observability stack
-# is Build 5's verbatim: collector + tempo + prometheus + loki + alloy
-# + grafana.
+# V2-1 introduces RabbitMQ as the campaign fan-out queue, replacing
+# V1's in-process channel. Producer (track-api) publishes per-event
+# to the `campaigns.fanout` exchange with routing_key=workspace_id;
+# the new campaign-worker (added in V2-1b) consumes per-workspace
+# queues with manual-ack semantics.
 #
 # Host port matrix:
 #   track-api       :8090    (container :8080 — 8080 squatted on this dev box)
 #   stub-receiver   :8091    (container :8081)
 #   MySQL           :3307    (container :3306 — 3306 reserved for "real" local MySQL)
+#   RabbitMQ AMQP   :5672    mgmt UI :15672    Prom :15692
 #   OTel collector  :4317    (OTLP/gRPC), :8889 (Prom scrape)
 #   Tempo           :3200
 #   Prometheus      :9090
 #   Loki            :3100
 #   Grafana         :3030
 services:
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+      - "15692:15692"   # rabbitmq_prometheus plugin (built into 3.13-management)
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
   mysql:
     image: mysql:8.0
     environment:
@@ -116,6 +130,7 @@ services:
         SERVICE: track-api
     environment:
       MYSQL_DSN: "bm:bm@tcp(mysql:3306)/bm?parseTime=true&multiStatements=true"
+      AMQP_URL: amqp://guest:guest@rabbitmq:5672/
       OTEL_EXPORTER_OTLP_ENDPOINT: otel-collector:4317
       OTEL_METRICS_EXEMPLAR_FILTER: trace_based
       STUB_RECEIVER_URL: http://stub-receiver:8081
@@ -124,6 +139,8 @@ services:
       - "8090:8080"
     depends_on:
       mysql:
+        condition: service_healthy
+      rabbitmq:
         condition: service_healthy
       otel-collector:
         condition: service_started
