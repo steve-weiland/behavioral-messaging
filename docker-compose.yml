@@ -160,3 +160,31 @@ services:
     depends_on:
       otel-collector:
         condition: service_started
+
+  # V2-1b: campaign-worker consumes per-workspace queues bound to
+  # campaigns.fanout. One container, configurable AMQP prefetch.
+  # Multiple replicas are safe (competing-consumer pattern) but we
+  # don't run them yet — V2-1c measures the ceiling first.
+  campaign-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: campaign-worker
+    environment:
+      MYSQL_DSN: "bm:bm@tcp(mysql:3306)/bm?parseTime=true&multiStatements=true"
+      AMQP_URL: amqp://guest:guest@rabbitmq:5672/
+      OTEL_EXPORTER_OTLP_ENDPOINT: otel-collector:4317
+      OTEL_METRICS_EXEMPLAR_FILTER: trace_based
+      STUB_RECEIVER_URL: http://stub-receiver:8081
+      PREFETCH: "32"
+      PORT: "8082"
+    ports:
+      - "8092:8082"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started

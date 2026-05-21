@@ -14,7 +14,7 @@ import (
 // internal/segment, internal/campaign) and the seed-* Make targets.
 
 func newTestServer() *server {
-	return &server{db: nil, dispatcher: nil, stubURL: ""}
+	return &server{db: nil, publisher: nil}
 }
 
 type rejectionCase struct {

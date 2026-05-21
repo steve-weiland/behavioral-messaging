@@ -1,20 +1,28 @@
-// track-api: behavioral-messaging V1 HTTP intake.
+// track-api: behavioral-messaging HTTP intake.
 //
 // Routes:
-//   - POST /events             accept an event, durably store it, hand to the campaign Dispatcher.
+//   - POST /events             accept an event, durably store it, publish to RabbitMQ.
 //   - POST /people, GET /people/{id}           identify / read-back.
 //   - POST /segments, GET /segments/{id}[/check]  define + scan-evaluate.
 //   - POST /campaigns, GET /campaigns/{id}     define + read-back.
 //   - GET  /healthz            liveness.
 //
-// Handler bodies + the dependency-bag live in server.go; main() does only
-// wiring (signals, observability, DB, HTTP client, Dispatcher) and runs
-// the HTTP server with graceful shutdown.
+// Handler bodies + the dep-bag live in server.go; main() does only
+// wiring (signals, observability, DB, AMQP, Publisher) and runs the
+// HTTP server with graceful shutdown.
+//
+// V2-1b: track-api is producer-only. Accepted events are published to
+// the `campaigns.fanout` exchange with routing_key=workspace_id. The
+// per-event fan-out work (campaign list, person.Get, trigger eval,
+// template render, stub-receiver POST, journey_enrollments audit)
+// now runs in cmd/campaign-worker, consuming per-workspace queues
+// with manual ack.
 //
 // Instrumentation:
 //   - otelhttp middleware around the mux (HTTP server span).
-//   - otelhttp.NewTransport on the outbound HTTP client (client span;
-//     traceparent propagated to stub-receiver via the Dispatcher).
+//   - amqpx.Publish injects W3C traceparent onto AMQP headers, so the
+//     worker's amqp.consume + campaign.process spans join the same
+//     trace as the original HTTP request.
 //   - slog JSON to stdout with trace_id/span_id auto-attached.
 package main
 
@@ -27,7 +35,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -60,16 +67,9 @@ func main() {
 	}
 	defer db.Close()
 
-	stubURL := strings.TrimRight(envOr("STUB_RECEIVER_URL", "http://stub-receiver:8081"), "/")
-	httpClient := &http.Client{
-		Timeout:   5 * time.Second,
-		Transport: otelhttp.NewTransport(http.DefaultTransport),
-	}
-
-	// V2-1a: connect to RabbitMQ and declare the producer-side topology
+	// V2-1: connect to RabbitMQ, declare the producer-side topology
 	// (campaigns.fanout exchange + DLX + DLQ). Per-workspace queues are
-	// declared by the worker (V2-1b). The connection is kept open for
-	// V2-1b's Publish path; in V2-1a it just proves the broker is wired.
+	// declared by cmd/campaign-worker.
 	amqpURL := envOr("AMQP_URL", "amqp://guest:guest@rabbitmq:5672/")
 	amqpConn, amqpCh, err := amqpx.ConnectWithRetry(amqpURL, 30*time.Second)
 	if err != nil {
@@ -85,14 +85,15 @@ func main() {
 		slog.String("dlx", campaign.ExchangeDLX),
 		slog.String("dlq", campaign.QueueDLQ))
 
-	// V1 PR 4: in-process campaign fan-out. Single consumer goroutine,
-	// buffered channel, drop-on-full with a Prometheus counter. V2-1b
-	// replaces the channel with RabbitMQ; the Dispatcher API stays.
-	dispatcher := campaign.NewDispatcher(db, httpClient, stubURL)
-	dispatcher.Start()
-	defer dispatcher.Stop()
+	// V2-1b: the Publisher replaces V1's in-process Dispatcher. The
+	// /events handler hands accepted events to Submit; a single
+	// publish goroutine drains a small in-process buffer and publishes
+	// to RabbitMQ. Per-event fan-out runs in cmd/campaign-worker.
+	publisher := campaign.NewPublisher(amqpCh)
+	publisher.Start()
+	defer publisher.Stop()
 
-	srv := newServer(db, dispatcher, stubURL)
+	srv := newServer(db, publisher)
 	mux := http.NewServeMux()
 	srv.routes(mux)
 

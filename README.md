@@ -150,6 +150,7 @@ driver and re-measure.
 |---|---|---|
 | `track-api` | `:8090` | container `:8080`; host `8080` squatted |
 | `stub-receiver` | `:8091` | container `:8081` |
+| `campaign-worker` | `:8092` | container `:8082`; tiny `/healthz` only |
 | MySQL | `:3307` | container `:3306`; host `:3306` left for any local MySQL |
 | RabbitMQ | `:5672` (AMQP), `:15672` (mgmt), `:15692` (Prom) | guest/guest creds; mgmt UI in browser |
 | OTel collector | `:4317` | OTLP/gRPC; Prom scrape `:8889` |
@@ -165,7 +166,8 @@ behavioral-messaging/
 ├── spec.md, README.md, Makefile, docker-compose.yml, Dockerfile
 ├── go.mod / go.sum
 ├── cmd/
-│   ├── track-api/                  V1 HTTP intake
+│   ├── track-api/                  V1 → V2 HTTP intake (now a producer-only — publishes to RabbitMQ)
+│   ├── campaign-worker/            V2 PR 7 — consumes per-workspace queues, runs the per-event Processor
 │   ├── stub-receiver/              V1 delivery sink
 │   ├── campaign-worker/            V1.x — campaign trigger + render (added next PR)
 │   ├── segment-worker/             V2 — incremental bitmap segment maintenance
@@ -179,8 +181,9 @@ behavioral-messaging/
 │   ├── amqpx/                      V2 PR 6 — thin amqp091 wrapper (Connect/Publish/Consume + traceparent propagation)
 │   ├── person/                     V1.x — person store
 │   ├── segment/                    V1.x — condition tree parser; V2 — roaring bitmap engine
-│   ├── campaign/                   V1 PR 4 — trigger eval + Go text/template render + Dispatcher (in-process channel + 1 consumer goroutine).
-│   │                               V2 PR 6 — topology.go (RabbitMQ exchange + DLX + DLQ declarations for V2-1)
+│   ├── campaign/                   V1 PR 4 → V2 PR 7 — trigger + template + processor.go (per-event fan-out
+│   │                               body, returns amqpx.Outcome) + publisher.go (RabbitMQ producer with
+│   │                               goroutine + bounded retry) + topology.go (exchange/DLX/DLQ + per-workspace queue helper)
 │   └── journey/                    V3 — FSM with delays
 ├── deploy/                         Build 5 carryover — collector/tempo/prom/loki/alloy/grafana
 │   └── grafana/provisioning/dashboards/ — red.json + use.json (panels TBD-rewritten for MySQL)
@@ -218,8 +221,9 @@ or log shipping. Day-1 dashboards.
 | `v0.1.0-foundation` | V1 PR 1 | Scaffold + Track API + stub receiver + MySQL + observability drop-in |
 | `v0.1.x` | V1 PRs 2-4 | Person store · segment evaluation (scan) · campaign trigger + in-process Dispatcher |
 | `v0.1.5-ceiling` | V1 PR 5 (tagged) | Load driver + V1 ceiling writeup (see [§ V1 ceiling](#v1-ceiling-on-this-hardware)). Bottleneck named: single Dispatcher consumer, 2.9× producer-consumer gap, ~69% drop rate at the soak rate. |
-| `v0.1.6-amqp` | V2 PR 6 (this commit) | RabbitMQ infra + `internal/amqpx/` + `campaigns.fanout` topology declared at track-api startup. Dispatch path unchanged — broker is wired but unused until V2 PR 7. |
-| `v0.2.0-throughput` | V2 PRs 7-8 | Dispatcher publishes to RabbitMQ · new `cmd/campaign-worker/` consumes per-workspace queues with manual ack · V2 ceiling measured + writeup |
+| `v0.1.6-amqp` | V2 PR 6 | RabbitMQ infra + `internal/amqpx/` + `campaigns.fanout` topology declared at track-api startup. Dispatch path unchanged. |
+| `v0.1.7-fanout` | V2 PR 7 (this commit) | Atomic switch — `Dispatcher` retired, `Publisher` publishes per accepted event to `campaigns.fanout` (routing_key=workspace_id), new `cmd/campaign-worker/` consumes per-workspace queues with manual ack + DLQ on terminal nack. End-to-end trace continuity verified. 10 s burst @ c=5 = 345 events/s with 0 publish drops, 0 DLQ messages, queue depth = 0. |
+| `v0.2.0-throughput` | V2 PR 8 | V2-1 ceiling re-measured on the same hardware; writeup compares against V1's 568 / 196 / 69% numbers and names the new bottleneck. |
 | `v0.3.0-durability` | V3 | Journey FSM · DLQs · per-workspace queue isolation (implementation or design-doc-only depending on interview timing) |
 
 ## Reading

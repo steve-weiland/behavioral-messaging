@@ -1,0 +1,279 @@
+package campaign
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"text/template"
+	"time"
+
+	"github.com/google/uuid"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/steveweiland/behavioral-messaging/internal/amqpx"
+	"github.com/steveweiland/behavioral-messaging/internal/event"
+	"github.com/steveweiland/behavioral-messaging/internal/person"
+	"github.com/steveweiland/behavioral-messaging/internal/segment"
+)
+
+// Processor is the per-event fan-out body shared between the V1
+// in-process dispatcher (retired in V2-1b) and the new
+// cmd/campaign-worker consumer. Holds the deps the per-event work
+// needs and a single OTel counter for successful dispatches.
+type Processor struct {
+	db         *sql.DB
+	httpClient *http.Client
+	stubURL    string
+	dispatched metric.Int64Counter
+}
+
+// NewProcessor wires the deps + initializes the dispatched counter
+// on the global meter.
+func NewProcessor(db *sql.DB, hc *http.Client, stubURL string) *Processor {
+	m := otel.Meter("campaigns")
+	dispatched, err := m.Int64Counter(
+		"campaign_dispatched_total",
+		metric.WithDescription("Campaign messages dispatched to the stub receiver."),
+	)
+	if err != nil {
+		panic(fmt.Errorf("campaign dispatched counter: %w", err))
+	}
+	return &Processor{
+		db:         db,
+		httpClient: hc,
+		stubURL:    stubURL,
+		dispatched: dispatched,
+	}
+}
+
+// Process is the per-event consumer body. Wrapped in a `campaign.process`
+// span so the work shows up in Tempo as a child of the producer's HTTP
+// span (the worker's amqpx.Consume already extracted the producer span
+// context from the AMQP headers).
+//
+// Outcome maps to RabbitMQ semantics:
+//
+//   - OutcomeAck         — success or no-match (best-effort: per-campaign
+//                          dispatch failures are logged but don't fail the
+//                          event; V2-3 idempotency closes the partial-
+//                          failure gap)
+//   - OutcomeNackRequeue — transient infra failure (MySQL down, etc.) —
+//                          worth retrying
+//   - OutcomeNackDrop    — terminal: person row missing (race vs delete),
+//                          will route to the DLQ
+func (p *Processor) Process(parent context.Context, ev event.Event) amqpx.Outcome {
+	tracer := otel.Tracer("campaigns")
+	ctx, span := tracer.Start(parent, "campaign.process",
+		trace.WithSpanKind(trace.SpanKindInternal),
+		trace.WithAttributes(
+			attribute.String("workspace_id", ev.WorkspaceID),
+			attribute.String("event_id", ev.EventID),
+			attribute.String("event_name", ev.Name),
+		),
+	)
+	defer span.End()
+
+	// Pull all campaigns for the workspace. V1 reads on every event;
+	// V2-2 caches.
+	campaigns, err := ListByWorkspace(ctx, p.db, ev.WorkspaceID)
+	if err != nil {
+		slog.ErrorContext(ctx, "campaign list failed",
+			slog.String("workspace_id", ev.WorkspaceID),
+			slog.Any("error", err))
+		span.RecordError(err)
+		return amqpx.OutcomeNackRequeue
+	}
+	if len(campaigns) == 0 {
+		return amqpx.OutcomeAck
+	}
+
+	per, err := person.Get(ctx, p.db, ev.WorkspaceID, ev.PersonID)
+	if errors.Is(err, person.ErrNotFound) {
+		// EnsureExists on the producer side should make this near-
+		// impossible; if it does happen, the person row was deleted
+		// after the event was published — terminal, route to DLQ.
+		slog.WarnContext(ctx, "person not found during campaign processing",
+			slog.String("workspace_id", ev.WorkspaceID),
+			slog.String("person_id", ev.PersonID))
+		span.RecordError(err)
+		return amqpx.OutcomeNackDrop
+	}
+	if err != nil {
+		slog.ErrorContext(ctx, "person get failed during campaign processing",
+			slog.String("workspace_id", ev.WorkspaceID),
+			slog.String("person_id", ev.PersonID),
+			slog.Any("error", err))
+		span.RecordError(err)
+		return amqpx.OutcomeNackRequeue
+	}
+
+	// For each campaign whose trigger matches, render + dispatch + audit.
+	// Per-campaign failures are logged but don't fail the whole event —
+	// V1 best-effort semantics preserved. V2-3 will introduce
+	// idempotency keys so a single failed dispatch can be retried
+	// without re-firing the ones that already succeeded.
+	for i := range campaigns {
+		c := &campaigns[i]
+		if !p.triggerMatches(ctx, c, per, ev) {
+			continue
+		}
+		rendered, err := renderTemplate(c.Template, per, ev)
+		if err != nil {
+			slog.ErrorContext(ctx, "template render failed",
+				slog.String("campaign_id", c.CampaignID),
+				slog.Any("error", err))
+			span.RecordError(err)
+			continue
+		}
+		enrollID := uuid.NewString()
+		if err := p.dispatch(ctx, c, per, ev, enrollID, rendered); err != nil {
+			slog.ErrorContext(ctx, "campaign dispatch failed",
+				slog.String("campaign_id", c.CampaignID),
+				slog.String("person_id", ev.PersonID),
+				slog.Any("error", err))
+			span.RecordError(err)
+			continue
+		}
+		if err := insertEnrollment(ctx, p.db, ev.WorkspaceID, enrollID, c.CampaignID, ev.PersonID, ev.EventID); err != nil {
+			slog.ErrorContext(ctx, "enrollment audit insert failed",
+				slog.String("campaign_id", c.CampaignID),
+				slog.Any("error", err))
+			span.RecordError(err)
+			// Audit failure doesn't reverse the dispatch — V2-1 acceptable.
+		}
+		p.dispatched.Add(ctx, 1,
+			metric.WithAttributes(
+				attribute.String("workspace_id", ev.WorkspaceID),
+				attribute.String("campaign_id", c.CampaignID),
+			))
+		slog.InfoContext(ctx, "campaign dispatched",
+			slog.String("campaign_id", c.CampaignID),
+			slog.String("person_id", ev.PersonID),
+			slog.String("event_id", ev.EventID),
+			slog.String("enrollment_id", enrollID))
+	}
+	return amqpx.OutcomeAck
+}
+
+func (p *Processor) triggerMatches(ctx context.Context, c *Campaign, per *person.Person, ev event.Event) bool {
+	cond, err := segment.DecodeCondition(c.Trigger)
+	if err != nil {
+		slog.ErrorContext(ctx, "stored trigger undecodable",
+			slog.String("campaign_id", c.CampaignID),
+			slog.Any("error", err))
+		return false
+	}
+	// EvalContext: the person + a single-event view containing just the
+	// inbound event. attr_eq looks at the person's attributes; event_seen
+	// matches iff the inbound event's name is the target.
+	ec := &segment.EvalContext{
+		Person: per,
+		Events: []event.Event{ev},
+	}
+	return cond.Evaluate(ec)
+}
+
+// dispatch posts the rendered message to the stub receiver. Sync HTTP
+// call — V2-1 simplicity. V2-3 introduces idempotency keys + two-phase
+// dispatch + per-campaign retry semantics.
+type stubPayload struct {
+	CampaignID     string `json:"campaign_id"`
+	PersonID       string `json:"person_id"`
+	EnrollmentID   string `json:"enrollment_id"`
+	TriggerEventID string `json:"trigger_event_id"`
+	Rendered       string `json:"rendered"`
+}
+
+func (p *Processor) dispatch(ctx context.Context, c *Campaign, per *person.Person, ev event.Event, enrollID, rendered string) error {
+	body, err := json.Marshal(stubPayload{
+		CampaignID:     c.CampaignID,
+		PersonID:       ev.PersonID,
+		EnrollmentID:   enrollID,
+		TriggerEventID: ev.EventID,
+		Rendered:       rendered,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal stub payload: %w", err)
+	}
+	dispatchCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(dispatchCtx, http.MethodPost, p.stubURL+"/", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("new request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("do: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return fmt.Errorf("stub status=%d", resp.StatusCode)
+	}
+	return nil
+}
+
+func insertEnrollment(ctx context.Context, db *sql.DB, workspaceID, enrollID, campaignID, personID, triggerEventID string) error {
+	const q = `
+		INSERT INTO journey_enrollments (workspace_id, enrollment_id, campaign_id, person_id, triggered_by)
+		VALUES (?, ?, ?, ?, ?)
+	`
+	if _, err := db.ExecContext(ctx, q, workspaceID, enrollID, campaignID, personID, triggerEventID); err != nil {
+		return fmt.Errorf("insert journey_enrollment: %w", err)
+	}
+	return nil
+}
+
+// ----- template rendering --------------------------------------------
+
+// renderContext is what templates see. Attributes are decoded once into
+// a map[string]any so callers can write {{.Attrs.plan}} without dealing
+// with json.RawMessage at template-eval time.
+type renderContext struct {
+	Person *person.Person
+	Event  event.Event
+	Attrs  map[string]any
+	Now    time.Time
+}
+
+// ParseTemplate validates a template string at insert-time. Returns an
+// error if the template doesn't parse. Used by the POST /campaigns
+// handler before the row is stored.
+func ParseTemplate(name, body string) error {
+	_, err := template.New(name).Option("missingkey=zero").Parse(body)
+	return err
+}
+
+func renderTemplate(body string, per *person.Person, ev event.Event) (string, error) {
+	tpl, err := template.New("campaign").Option("missingkey=zero").Parse(body)
+	if err != nil {
+		return "", fmt.Errorf("parse template: %w", err)
+	}
+	var attrs map[string]any
+	if len(per.Attributes) > 0 {
+		if err := json.Unmarshal(per.Attributes, &attrs); err != nil {
+			// Person attributes are a JSON column — decode failure means
+			// corruption. Best-effort: render with empty map.
+			attrs = map[string]any{}
+		}
+	}
+	ctx := renderContext{
+		Person: per,
+		Event:  ev,
+		Attrs:  attrs,
+		Now:    time.Now().UTC(),
+	}
+	var buf bytes.Buffer
+	if err := tpl.Execute(&buf, ctx); err != nil {
+		return "", fmt.Errorf("execute template: %w", err)
+	}
+	return buf.String(), nil
+}

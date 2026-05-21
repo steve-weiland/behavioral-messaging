@@ -71,14 +71,18 @@ type defineCampaignRequest struct {
 // server is the dep-bag every track-api handler closes over. main() builds
 // one and calls routes() once; tests build one with fakes/stubs and call
 // the handler methods directly via httptest.
+//
+// V2-1b: dispatcher field replaced with publisher — the /events handler
+// hands accepted events to the Publisher, which puts them on RabbitMQ.
+// The actual fan-out work (stub-receiver POST + audit insert) lives in
+// cmd/campaign-worker.
 type server struct {
-	db         *sql.DB
-	dispatcher *campaign.Dispatcher
-	stubURL    string
+	db        *sql.DB
+	publisher *campaign.Publisher
 }
 
-func newServer(db *sql.DB, d *campaign.Dispatcher, stubURL string) *server {
-	return &server{db: db, dispatcher: d, stubURL: stubURL}
+func newServer(db *sql.DB, pub *campaign.Publisher) *server {
+	return &server{db: db, publisher: pub}
 }
 
 func (s *server) routes(mux *http.ServeMux) {
@@ -513,12 +517,13 @@ func (s *server) handleEventsPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Hand the event to the in-process campaign dispatcher. Submit
-	// detaches from the request context so the consumer outlives the
-	// handler; the producer's span context is preserved so the async
-	// campaign.process span joins this trace. Drop-on-full is logged
-	// + counted inside Submit.
-	s.dispatcher.Submit(r.Context(), ev)
+	// V2-1b: hand the event to the RabbitMQ publisher. Submit detaches
+	// from the request context (so the publish goroutine outlives the
+	// handler), preserves the producer's span context (so the amqp.publish
+	// span + downstream worker spans join this trace), and never blocks.
+	// Buffer-full and shutdown drops are counted on
+	// campaign_publish_dropped_total{workspace_id, reason}.
+	s.publisher.Submit(r.Context(), ev)
 
 	slog.InfoContext(r.Context(), "event accepted",
 		slog.String("workspace_id", workspace),
