@@ -23,7 +23,7 @@ discovery.relabel "containers" {
   // (b) fail Loki's max-age window on long-running ones.
   rule {
     source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
-    regex         = "observability-stack"
+    regex         = "behavioral-messaging"
     action        = "keep"
   }
 
