@@ -208,8 +208,8 @@ func (d *Dispatcher) process(parent context.Context, ev event.Event) {
 			span.RecordError(err)
 			continue
 		}
-		enrolID := uuid.NewString()
-		if err := d.dispatch(ctx, c, p, ev, enrolID, rendered); err != nil {
+		enrollID := uuid.NewString()
+		if err := d.dispatch(ctx, c, p, ev, enrollID, rendered); err != nil {
 			slog.ErrorContext(ctx, "campaign dispatch failed",
 				slog.String("campaign_id", c.CampaignID),
 				slog.String("person_id", ev.PersonID),
@@ -217,8 +217,8 @@ func (d *Dispatcher) process(parent context.Context, ev event.Event) {
 			span.RecordError(err)
 			continue
 		}
-		if err := insertEnrolment(ctx, d.db, ev.WorkspaceID, enrolID, c.CampaignID, ev.PersonID, ev.EventID); err != nil {
-			slog.ErrorContext(ctx, "enrolment audit insert failed",
+		if err := insertEnrollment(ctx, d.db, ev.WorkspaceID, enrollID, c.CampaignID, ev.PersonID, ev.EventID); err != nil {
+			slog.ErrorContext(ctx, "enrollment audit insert failed",
 				slog.String("campaign_id", c.CampaignID),
 				slog.Any("error", err))
 			span.RecordError(err)
@@ -233,7 +233,7 @@ func (d *Dispatcher) process(parent context.Context, ev event.Event) {
 			slog.String("campaign_id", c.CampaignID),
 			slog.String("person_id", ev.PersonID),
 			slog.String("event_id", ev.EventID),
-			slog.String("enrolment_id", enrolID))
+			slog.String("enrollment_id", enrollID))
 	}
 }
 
@@ -261,16 +261,16 @@ func (d *Dispatcher) triggerMatches(ctx context.Context, c *Campaign, p *person.
 type stubPayload struct {
 	CampaignID     string `json:"campaign_id"`
 	PersonID       string `json:"person_id"`
-	EnrolmentID    string `json:"enrolment_id"`
+	EnrollmentID   string `json:"enrollment_id"`
 	TriggerEventID string `json:"trigger_event_id"`
 	Rendered       string `json:"rendered"`
 }
 
-func (d *Dispatcher) dispatch(ctx context.Context, c *Campaign, p *person.Person, ev event.Event, enrolID, rendered string) error {
+func (d *Dispatcher) dispatch(ctx context.Context, c *Campaign, p *person.Person, ev event.Event, enrollID, rendered string) error {
 	body, err := json.Marshal(stubPayload{
 		CampaignID:     c.CampaignID,
 		PersonID:       ev.PersonID,
-		EnrolmentID:    enrolID,
+		EnrollmentID:   enrollID,
 		TriggerEventID: ev.EventID,
 		Rendered:       rendered,
 	})
@@ -295,13 +295,13 @@ func (d *Dispatcher) dispatch(ctx context.Context, c *Campaign, p *person.Person
 	return nil
 }
 
-func insertEnrolment(ctx context.Context, db *sql.DB, workspaceID, enrolID, campaignID, personID, triggerEventID string) error {
+func insertEnrollment(ctx context.Context, db *sql.DB, workspaceID, enrollID, campaignID, personID, triggerEventID string) error {
 	const q = `
-		INSERT INTO journey_enrolments (workspace_id, enrolment_id, campaign_id, person_id, triggered_by)
+		INSERT INTO journey_enrollments (workspace_id, enrollment_id, campaign_id, person_id, triggered_by)
 		VALUES (?, ?, ?, ?, ?)
 	`
-	if _, err := db.ExecContext(ctx, q, workspaceID, enrolID, campaignID, personID, triggerEventID); err != nil {
-		return fmt.Errorf("insert journey_enrolment: %w", err)
+	if _, err := db.ExecContext(ctx, q, workspaceID, enrollID, campaignID, personID, triggerEventID); err != nil {
+		return fmt.Errorf("insert journey_enrollment: %w", err)
 	}
 	return nil
 }

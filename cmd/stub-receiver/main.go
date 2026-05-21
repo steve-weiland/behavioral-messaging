@@ -1,7 +1,7 @@
 // stub-receiver: stand-in for downstream delivery providers
 // (ESP/APNs/FCM/Twilio/webhook receivers).
 //
-// V1 behaviour:
+// V1 behavior:
 //   - POST / accepts any JSON body, logs it as INFO with trace_id, returns 200.
 //   - GET /healthz → {"status":"ok"}.
 //

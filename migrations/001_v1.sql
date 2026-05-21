@@ -6,7 +6,7 @@
 -- cheap; integrity is enforced at the application layer.
 --
 -- Mounted into the MySQL container at /docker-entrypoint-initdb.d so
--- it runs once on first start (vanilla mysql:8.0 behaviour). No
+-- it runs once on first start (vanilla mysql:8.0 behavior). No
 -- migration framework — this is V1.
 
 CREATE TABLE IF NOT EXISTS workspaces (
@@ -42,18 +42,19 @@ CREATE TABLE IF NOT EXISTS events (
     KEY idx_events_workspace_name_received (workspace_id, event_name, received_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- Audit trail of campaign enrolments. V1 won't have campaigns yet, but
+-- Audit trail of campaign enrollments. V1 won't have campaigns yet, but
 -- the table exists so PR 2+ can write rows without a schema migration.
-CREATE TABLE IF NOT EXISTS journey_enrolments (
+-- `enrolled_at` keeps single-L past-tense spelling (same in US + UK).
+CREATE TABLE IF NOT EXISTS journey_enrollments (
     workspace_id     VARCHAR(64)  NOT NULL,
-    enrolment_id     VARCHAR(36)  NOT NULL,
+    enrollment_id    VARCHAR(36)  NOT NULL,
     campaign_id      VARCHAR(64)  NOT NULL,
     person_id        VARCHAR(128) NOT NULL,
     triggered_by     VARCHAR(36)  NOT NULL,             -- event_id reference
     enrolled_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (workspace_id, enrolment_id),
-    KEY idx_enrolments_workspace_campaign (workspace_id, campaign_id, enrolled_at),
-    KEY idx_enrolments_workspace_person (workspace_id, person_id, enrolled_at)
+    PRIMARY KEY (workspace_id, enrollment_id),
+    KEY idx_enrollments_workspace_campaign (workspace_id, campaign_id, enrolled_at),
+    KEY idx_enrollments_workspace_person (workspace_id, person_id, enrolled_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- Idempotency-keys table for V2 two-phase dispatch. Empty in V1; rows

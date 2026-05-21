@@ -98,7 +98,7 @@ behavioral-messaging/
 │   └── journey/                    V3 — FSM with delays
 ├── deploy/                         Build 5 carryover — collector/tempo/prom/loki/alloy/grafana
 │   └── grafana/provisioning/dashboards/ — red.json + use.json (panels TBD-rewritten for MySQL)
-├── migrations/                     001_v1.sql (workspaces, people, events, journey_enrolments, idempotency_keys) · 002_segments.sql · 003_campaigns.sql
+├── migrations/                     001_v1.sql (workspaces, people, events, journey_enrollments, idempotency_keys) · 002_segments.sql · 003_campaigns.sql
 └── chaos/                          load + chaos scripts (added next PR)
 ```
 

@@ -485,7 +485,7 @@ func (s *server) handleEventsPost(w http.ResponseWriter, r *http.Request) {
 	}
 	// V1 PR 2: tracking auto-creates the person row with empty
 	// attributes if absent — matches Customer.io's identify-on-track
-	// behaviour. INSERT IGNORE is a no-op on PK collision so
+	// behavior. INSERT IGNORE is a no-op on PK collision so
 	// existing rows are never clobbered. (BM-29.)
 	if err := person.EnsureExists(r.Context(), s.db, workspace, req.PersonID); err != nil {
 		slog.ErrorContext(r.Context(), "person ensure failed",

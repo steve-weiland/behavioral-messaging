@@ -37,7 +37,7 @@ func Open(dsn string) (*sql.DB, error) {
 // retry with the same event_id silently succeeds (ON DUPLICATE KEY → no
 // row written; idempotency at the storage layer). This is intentional —
 // V1 doesn't yet have the dispatch-side idempotency table to back it up,
-// but the storage layer's behaviour is correct either way.
+// but the storage layer's behavior is correct either way.
 func Insert(ctx context.Context, db *sql.DB, e event.Event) error {
 	const q = `
 		INSERT INTO events (workspace_id, event_id, person_id, event_name, payload, received_at)
