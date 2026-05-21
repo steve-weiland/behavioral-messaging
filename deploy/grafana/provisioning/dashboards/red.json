@@ -161,12 +161,12 @@
       "id": 8,
       "type": "stat",
       "title": "Error budget burned (28d) — POST /events",
-      "description": "V2 PR 7 / OBS-161. SLO: 99% of POST /events return 2xx in ≤500ms over 28d. Stat shows % of the 1% error budget consumed; thresholds at 50% and 100%.",
+      "description": "V2 PR 7 / OBS-161. SLO: 99% of POST /events return 2xx in ≤500ms over 28d. Stat shows % of the 1% error budget consumed; thresholds at 50% and 100%. clamp_max at 100% — the recording rule can briefly emit values >>100% at start of life when the 28d window has only minutes of data and a single error looks enormous against the still-tiny accumulated budget.",
       "datasource": {"type": "prometheus", "uid": "prometheus"},
       "targets": [
         {
           "refId": "A",
-          "expr": "slo:track_budget_burn_pct:28d * 100",
+          "expr": "clamp_max(slo:track_budget_burn_pct:28d * 100, 100)",
           "legendFormat": "burned"
         }
       ],
