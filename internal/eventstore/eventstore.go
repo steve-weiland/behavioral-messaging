@@ -9,6 +9,7 @@ package eventstore
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 
 	_ "github.com/go-sql-driver/mysql" // registers "mysql" sql driver
@@ -49,4 +50,40 @@ func Insert(ctx context.Context, db *sql.DB, e event.Event) error {
 		return fmt.Errorf("insert event: %w", err)
 	}
 	return nil
+}
+
+// RecentByPerson returns the most recent N events for a person, newest
+// first. Used by the V1 scan-based segment evaluator to answer
+// `event_seen` predicates. V2's bitmap path obviates this — see V2 spec.
+//
+// `limit` caps the rows pulled into memory. V1 chooses 1000 in the
+// handler — enough to answer "ever seen?" for typical demo profiles
+// without unbounded scans on hot profiles.
+func RecentByPerson(ctx context.Context, db *sql.DB, workspaceID, personID string, limit int) ([]event.Event, error) {
+	const q = `
+		SELECT workspace_id, event_id, person_id, event_name, payload, received_at
+		FROM events
+		WHERE workspace_id = ? AND person_id = ?
+		ORDER BY received_at DESC
+		LIMIT ?
+	`
+	rows, err := db.QueryContext(ctx, q, workspaceID, personID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("select events: %w", err)
+	}
+	defer rows.Close()
+	var out []event.Event
+	for rows.Next() {
+		var e event.Event
+		var payload []byte
+		if err := rows.Scan(&e.WorkspaceID, &e.EventID, &e.PersonID, &e.Name, &payload, &e.ReceivedAt); err != nil {
+			return nil, fmt.Errorf("scan event: %w", err)
+		}
+		e.Payload = json.RawMessage(payload)
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows err: %w", err)
+	}
+	return out, nil
 }

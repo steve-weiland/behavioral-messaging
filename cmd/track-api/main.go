@@ -41,6 +41,7 @@ import (
 	"github.com/steveweiland/behavioral-messaging/internal/logsx"
 	"github.com/steveweiland/behavioral-messaging/internal/otelinit"
 	"github.com/steveweiland/behavioral-messaging/internal/person"
+	"github.com/steveweiland/behavioral-messaging/internal/segment"
 )
 
 const serviceName = "track-api"
@@ -63,6 +64,28 @@ type identifyRequest struct {
 // 16 KiB cap on /people attribute payloads — matches the implicit cap
 // on event payloads. Reviewed in the V1 spec as BM-26.
 const maxAttributesBytes = 16 * 1024
+
+// V1 PR 3 caps. 16 KiB is plenty for an `and` of `or`s; depth is bounded
+// in internal/segment at 8 to bound stack usage on Evaluate.
+const maxSegmentDefBytes = 16 * 1024
+
+// Cap how many events the scan-based segment evaluator pulls per check.
+// Enough to answer `event_seen ever` on demo-sized profiles. V2's
+// incremental bitmap path removes this scan entirely.
+const segmentScanEventLimit = 1000
+
+type defineSegmentRequest struct {
+	SegmentID  string          `json:"segment_id"`
+	Name       string          `json:"name"`
+	Definition json.RawMessage `json:"definition"`
+}
+
+type segmentCheckResponse struct {
+	WorkspaceID string `json:"workspace_id"`
+	SegmentID   string `json:"segment_id"`
+	PersonID    string `json:"person_id"`
+	Member      bool   `json:"member"`
+}
 
 func main() {
 	rootCtx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -176,6 +199,172 @@ func main() {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(p)
+	})
+
+	// V1 PR 3: segments — define + read + scan-based membership check.
+	// One handler intentionally serves both `/segments` (POST) and
+	// `/segments/{segment_id}` and `/segments/{segment_id}/check`.
+	// net/http's ServeMux doesn't pattern-match path segments before
+	// Go 1.22; we route on a trimmed suffix instead.
+	mux.HandleFunc("/segments", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		workspace := r.Header.Get("X-Workspace-ID")
+		if !validID(workspace) {
+			writeErr(w, http.StatusBadRequest, "X-Workspace-ID required ([A-Za-z0-9_-]{1,64})")
+			return
+		}
+		body, err := readBody(r, maxSegmentDefBytes)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		var req defineSegmentRequest
+		if err := json.Unmarshal(body, &req); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		if !validID(req.SegmentID) {
+			writeErr(w, http.StatusBadRequest, "segment_id required ([A-Za-z0-9_-]{1,64})")
+			return
+		}
+		if req.Name == "" || len(req.Name) > 255 {
+			writeErr(w, http.StatusBadRequest, "name required, ≤ 255 chars")
+			return
+		}
+		if len(req.Definition) == 0 {
+			writeErr(w, http.StatusBadRequest, "definition required")
+			return
+		}
+		cond, err := segment.DecodeCondition(req.Definition)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "definition: "+err.Error())
+			return
+		}
+		if err := cond.Validate(); err != nil {
+			writeErr(w, http.StatusBadRequest, "definition: "+err.Error())
+			return
+		}
+		s := segment.Segment{
+			WorkspaceID: workspace,
+			SegmentID:   req.SegmentID,
+			Name:        req.Name,
+			Definition:  req.Definition,
+		}
+		if err := segment.Create(r.Context(), db, s); err != nil {
+			slog.ErrorContext(r.Context(), "segment create failed",
+				slog.String("workspace_id", workspace),
+				slog.String("segment_id", req.SegmentID),
+				slog.Any("error", err))
+			writeErr(w, http.StatusInternalServerError, "store failed")
+			return
+		}
+		slog.InfoContext(r.Context(), "segment created",
+			slog.String("workspace_id", workspace),
+			slog.String("segment_id", req.SegmentID),
+			slog.String("name", req.Name))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
+
+	mux.HandleFunc("/segments/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		workspace := r.Header.Get("X-Workspace-ID")
+		if !validID(workspace) {
+			writeErr(w, http.StatusBadRequest, "X-Workspace-ID required ([A-Za-z0-9_-]{1,64})")
+			return
+		}
+		// /segments/{id}              → read one
+		// /segments/{id}/check        → scan-evaluate for ?person_id=<id>
+		suffix := strings.TrimPrefix(r.URL.Path, "/segments/")
+		segmentID, remainder, _ := strings.Cut(suffix, "/")
+		if !validID(segmentID) {
+			writeErr(w, http.StatusBadRequest, "segment_id path segment required")
+			return
+		}
+
+		s, err := segment.Get(r.Context(), db, workspace, segmentID)
+		if errors.Is(err, segment.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "segment not found")
+			return
+		}
+		if err != nil {
+			slog.ErrorContext(r.Context(), "segment get failed",
+				slog.String("workspace_id", workspace),
+				slog.String("segment_id", segmentID),
+				slog.Any("error", err))
+			writeErr(w, http.StatusInternalServerError, "store failed")
+			return
+		}
+
+		switch remainder {
+		case "":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(s)
+			return
+		case "check":
+			// Scan path: pull person + recent events, evaluate.
+			personID := r.URL.Query().Get("person_id")
+			if !validID(personID) {
+				writeErr(w, http.StatusBadRequest, "person_id query parameter required")
+				return
+			}
+			p, err := person.Get(r.Context(), db, workspace, personID)
+			if errors.Is(err, person.ErrNotFound) {
+				// A person that doesn't exist is, by definition, not a member.
+				_ = json.NewEncoder(w).Encode(segmentCheckResponse{
+					WorkspaceID: workspace, SegmentID: segmentID, PersonID: personID, Member: false,
+				})
+				return
+			}
+			if err != nil {
+				slog.ErrorContext(r.Context(), "person get failed during segment check",
+					slog.String("workspace_id", workspace),
+					slog.String("person_id", personID),
+					slog.Any("error", err))
+				writeErr(w, http.StatusInternalServerError, "store failed")
+				return
+			}
+			events, err := eventstore.RecentByPerson(r.Context(), db, workspace, personID, segmentScanEventLimit)
+			if err != nil {
+				slog.ErrorContext(r.Context(), "events scan failed",
+					slog.String("workspace_id", workspace),
+					slog.String("person_id", personID),
+					slog.Any("error", err))
+				writeErr(w, http.StatusInternalServerError, "store failed")
+				return
+			}
+			cond, err := segment.DecodeCondition(s.Definition)
+			if err != nil {
+				// Stored row failed to decode — should never happen post-Validate.
+				slog.ErrorContext(r.Context(), "stored segment definition undecodable",
+					slog.String("segment_id", segmentID),
+					slog.Any("error", err))
+				writeErr(w, http.StatusInternalServerError, "definition decode failed")
+				return
+			}
+			member := cond.Evaluate(&segment.EvalContext{Person: p, Events: events})
+			slog.InfoContext(r.Context(), "segment check",
+				slog.String("workspace_id", workspace),
+				slog.String("segment_id", segmentID),
+				slog.String("person_id", personID),
+				slog.Bool("member", member),
+				slog.Int("events_scanned", len(events)))
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(segmentCheckResponse{
+				WorkspaceID: workspace, SegmentID: segmentID, PersonID: personID, Member: member,
+			})
+			return
+		default:
+			writeErr(w, http.StatusNotFound, "unknown segment sub-path")
+			return
+		}
 	})
 
 	mux.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {

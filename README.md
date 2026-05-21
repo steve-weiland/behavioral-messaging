@@ -49,6 +49,9 @@ make down        # tear it all down
 | http://localhost:8090/healthz | `track-api` (V1) — `{"status":"ok"}` |
 | `POST http://localhost:8090/people` | Identify / attribute upsert. `JSON_MERGE_PATCH` semantics — `null` value deletes the key. *(V1 PR 2)* |
 | `GET  http://localhost:8090/people/<id>` | Read one person back. *(V1 PR 2)* |
+| `POST http://localhost:8090/segments` | Define a segment with a JSON condition tree (`and`/`or`/`not` + `attr_eq`/`attr_exists`/`event_seen`). Depth cap 8. *(V1 PR 3)* |
+| `GET  http://localhost:8090/segments/<id>` | Read the stored definition. *(V1 PR 3)* |
+| `GET  http://localhost:8090/segments/<id>/check?person_id=<pid>` | Scan-eval membership for one person. V2's bitmap path removes the scan. *(V1 PR 3)* |
 | http://localhost:8091/healthz | `stub-receiver` (V1) |
 | http://localhost:3030/explore | Grafana — Tempo / Prometheus / Loki datasources provisioned. Try `{resource.service.name="track-api"}` in Tempo Search. |
 | http://localhost:3030/d/obs-red | RED dashboard (carried from Build 5). V1 panels populate once traffic flows. |
