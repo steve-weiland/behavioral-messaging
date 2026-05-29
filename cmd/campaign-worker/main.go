@@ -73,9 +73,20 @@ func main() {
 	defer db.Close()
 
 	stubURL := strings.TrimRight(envOr("STUB_RECEIVER_URL", "http://stub-receiver:8081"), "/")
+	// The stub POST runs once per in-flight delivery, so the connection
+	// pool must be sized to prefetch — http.DefaultTransport caps
+	// MaxIdleConnsPerHost at 2, which under high prefetch forces a fresh
+	// TCP dial per dispatch and exhausts the ephemeral port range
+	// ("cannot assign requested address"). Pool to prefetch so warm
+	// connections are reused instead. (V2 throughput-test finding.)
+	prefetch := envInt("PREFETCH", 32)
+	stubTransport := http.DefaultTransport.(*http.Transport).Clone()
+	stubTransport.MaxIdleConns = prefetch * 2
+	stubTransport.MaxIdleConnsPerHost = prefetch
+	stubTransport.MaxConnsPerHost = prefetch
 	httpClient := &http.Client{
 		Timeout:   5 * time.Second,
-		Transport: otelhttp.NewTransport(http.DefaultTransport),
+		Transport: otelhttp.NewTransport(stubTransport),
 	}
 
 	amqpURL := envOr("AMQP_URL", "amqp://guest:guest@rabbitmq:5672/")
@@ -94,7 +105,6 @@ func main() {
 		log.Fatalf("amqp topology: %v", err)
 	}
 
-	prefetch := envInt("PREFETCH", 32)
 	processor := campaign.NewProcessor(db, httpClient, stubURL)
 
 	workspaces, err := listWorkspaces(rootCtx, db)

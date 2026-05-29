@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"text/template"
@@ -62,13 +63,13 @@ func NewProcessor(db *sql.DB, hc *http.Client, stubURL string) *Processor {
 // Outcome maps to RabbitMQ semantics:
 //
 //   - OutcomeAck         — success or no-match (best-effort: per-campaign
-//                          dispatch failures are logged but don't fail the
-//                          event; V2-3 idempotency closes the partial-
-//                          failure gap)
+//     dispatch failures are logged but don't fail the
+//     event; V2-3 idempotency closes the partial-
+//     failure gap)
 //   - OutcomeNackRequeue — transient infra failure (MySQL down, etc.) —
-//                          worth retrying
+//     worth retrying
 //   - OutcomeNackDrop    — terminal: person row missing (race vs delete),
-//                          will route to the DLQ
+//     will route to the DLQ
 func (p *Processor) Process(parent context.Context, ev event.Event) amqpx.Outcome {
 	tracer := otel.Tracer("campaigns")
 	ctx, span := tracer.Start(parent, "campaign.process",
@@ -214,7 +215,16 @@ func (p *Processor) dispatch(ctx context.Context, c *Campaign, per *person.Perso
 	if err != nil {
 		return fmt.Errorf("do: %w", err)
 	}
-	defer resp.Body.Close()
+	// Drain the body to EOF before closing — net/http only returns a
+	// connection to the idle pool when the response body is fully read
+	// AND closed. Closing an unread body discards the TCP connection, so
+	// under high prefetch every dispatch dials fresh and exhausts the
+	// ephemeral port range ("cannot assign requested address"). Draining
+	// is what makes the transport's keep-alive pool actually reusable.
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
 	if resp.StatusCode/100 != 2 {
 		return fmt.Errorf("stub status=%d", resp.StatusCode)
 	}

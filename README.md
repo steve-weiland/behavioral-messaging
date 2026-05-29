@@ -15,7 +15,7 @@ changed, what now breaks" writeup with hardware-pinned measurements.
 | | |
 |--|--|
 | **Spec** | [`spec.md`](./spec.md) — RFC-2119 V1 + V2 + V3 requirements |
-| **Status** | `v0.1.5-foundation-complete`. Six V1 surfaces shipped — Track API, person store, segment store + scan eval, campaign trigger + in-process Dispatcher, stub receiver, full observability scaffold. V1 load-test run on 2026-05-21 — see [§ V1 ceiling](#v1-ceiling-on-this-hardware). |
+| **Status** | `v0.2.0-throughput`. V1 foundation shipped (six surfaces) + V2-1 RabbitMQ async fan-out live. V2-1 ceiling re-measured 2026-05-29: fan-out **~2,800 events/s, zero loss (~14× V1)** — see [§ V2-1 ceiling](#v2-1-ceiling-measured-2026-05-29). V1 baseline: [§ V1 ceiling](#v1-ceiling-on-this-hardware). |
 | **Stack** | Go 1.25 · MySQL 8.0 · OpenTelemetry SDK + Collector 0.151 · Tempo 2.10 · Prometheus 3.11 · Loki 3.7 · Grafana Alloy v1.16 · Grafana 13.0 · `docker compose` |
 
 ---
@@ -120,9 +120,65 @@ bottleneck V2 was always going to remove.
 | **V2-2** | Roaring bitmaps with incremental segment maintenance (`RoaringBitmap/roaring` upstream) | Per-event `ListByWorkspace` scan + the scan-based segment evaluator (BM‑33, BM‑36). |
 | **V2-3** | Idempotency keys + two-phase dispatch (`sending` → ack → `sent`) | Audit-failure-doesn't-reverse-dispatch gap (BM‑78). Retries become safe. |
 
-V2's expected new ceiling once the consumer parallelizes: **render CPU
-per workspace** and bitmap memory accounting. We'll re-run the same load
-driver and re-measure.
+### V2-1 ceiling (measured 2026-05-29)
+
+Re-measured on the same hardware with a new Go load driver
+(`cmd/loadgen/`) — keep-alive connection reuse pushes ~6× past the bash
+driver's ~557/s process-spawn ceiling, enough to actually stress the
+stack. Fan-out sampled live with `chaos/watch-fanout.sh` (RabbitMQ mgmt
+API + `docker stats`); the worker's drain rate is the `journey_enrollments`
+slope, read straight from MySQL so the OTel→Prometheus scrape lag can't
+distort it. Driver: 100 closed-loop goroutines, 60s, `welcome_pro`
+matching every event.
+
+`PREFETCH` is the worker's RabbitMQ consumer prefetch — how many
+unacked deliveries the broker will hand one consumer at once, i.e. the
+cap on events the worker processes concurrently. Each in-flight event
+does the full fan-out (campaign lookup → trigger eval → render → stub
+POST → enrollment insert), so prefetch is the worker's concurrency dial.
+
+| `PREFETCH` | Worker fan-out rate | Peak queue backlog | Worker CPU | MySQL CPU | Loss |
+|---|---|---|---|---|---|
+| 32 (default) | ~1,675/s | 103,670 | 479% | 283% | 0 |
+| 128 (before fixes) | collapse — 40s stall | 78,895 | **1,320%** | 312% | 0 |
+| 128 (after fixes) | **~2,880/s** | 28,339 | 240% | 330% | 0 |
+| 256 (after fixes) | ~2,750/s (no gain) | 17,683 | 211% | **342%** | 0 |
+
+**V1 → V2-1 headline:** V1's single Dispatcher goroutine fanned out at
+~196/s and **silently dropped ~69%** of accepted events. V2-1 makes loss
+structurally impossible — the durable queue absorbs the
+producer/consumer gap as a drainable backlog (`publish_dropped_total == 0`
+in every run) — and after the fixes below the worker sustains **~2,800/s,
+~14× the V1 fan-out rate**.
+
+**New bottleneck:** per-event MySQL work (`ListByWorkspace` + `people.Get`
++ enrollment `INSERT`) on the single shared instance, bounded by the
+worker's 25-connection pool. Past `PREFETCH=128`, more consumer
+concurrency buys nothing — MySQL is the busiest dependency (~342%) while
+the worker idles at ~211% CPU. V2-2 (roaring bitmaps + removing the
+per-event `ListByWorkspace` scan) is positioned to lift exactly this.
+
+#### What broke: two latent Go HTTP bugs
+
+Naively bumping `PREFETCH` 32→128 to chase a higher number made
+throughput *worse* and exposed two classic connection-leak bugs in the
+worker's stub dispatch:
+
+1. **Default transport pool** — the stub client wrapped
+   `http.DefaultTransport` (`MaxIdleConnsPerHost = 2`), so under high
+   prefetch almost every dispatch dialed a brand-new TCP connection.
+2. **Undrained response body (the dominant one)** — the dispatch closed
+   `resp.Body` without reading it to EOF. `net/http` only pools a
+   connection when the body is fully drained *and* closed; closing an
+   unread body discards the socket, defeating any pool sizing.
+
+Together → ephemeral-port exhaustion (`connect: cannot assign requested
+address`), ~73k failed dispatches, a nack-requeue storm, and a
+13-of-14-core CPU burn while throughput collapsed. Fixing both (size the
+transport pool to `PREFETCH`; `io.Copy(io.Discard, resp.Body)` before
+close) dropped worker CPU 1,320%→240% and raised fan-out +70%
+(1,675→2,880/s) with zero errors. This is the V2-1 "what broke and how I
+fixed it" story.
 
 
 
@@ -188,7 +244,8 @@ behavioral-messaging/
 ├── deploy/                         Build 5 carryover — collector/tempo/prom/loki/alloy/grafana
 │   └── grafana/provisioning/dashboards/ — red.json + use.json (panels TBD-rewritten for MySQL)
 ├── migrations/                     001_v1.sql (workspaces, people, events, journey_enrollments, idempotency_keys) · 002_segments.sql · 003_campaigns.sql
-└── chaos/                          load-v1.sh — bash+curl V1 driver (Go loadgen lands in V2)
+└── chaos/                          load-v1.sh (bash V1 driver) · watch-fanout.sh (live backlog+CPU sampler) ·
+                                    ceiling-run.sh (V2 measured-run orchestrator; pairs with cmd/loadgen/)
 ```
 
 ## Why these decisions
@@ -223,7 +280,7 @@ or log shipping. Day-1 dashboards.
 | `v0.1.5-ceiling` | V1 PR 5 (tagged) | Load driver + V1 ceiling writeup (see [§ V1 ceiling](#v1-ceiling-on-this-hardware)). Bottleneck named: single Dispatcher consumer, 2.9× producer-consumer gap, ~69% drop rate at the soak rate. |
 | `v0.1.6-amqp` | V2 PR 6 | RabbitMQ infra + `internal/amqpx/` + `campaigns.fanout` topology declared at track-api startup. Dispatch path unchanged. |
 | `v0.1.7-fanout` | V2 PR 7 (this commit) | Atomic switch — `Dispatcher` retired, `Publisher` publishes per accepted event to `campaigns.fanout` (routing_key=workspace_id), new `cmd/campaign-worker/` consumes per-workspace queues with manual ack + DLQ on terminal nack. End-to-end trace continuity verified. 10 s burst @ c=5 = 345 events/s with 0 publish drops, 0 DLQ messages, queue depth = 0. |
-| `v0.2.0-throughput` | V2 PR 8 | V2-1 ceiling re-measured on the same hardware; writeup compares against V1's 568 / 196 / 69% numbers and names the new bottleneck. |
+| `v0.2.0-throughput` | V2 PR 8 (tagged) | V2-1 ceiling re-measured on the same hardware — fan-out **~2,800/s, zero loss (~14× V1's 196/s)**, new bottleneck named (per-event MySQL over the 25-conn pool). New Go `cmd/loadgen/` + `chaos/watch-fanout.sh` + `chaos/ceiling-run.sh`. Found + fixed two Go HTTP connection-leak bugs that were masking the ceiling. See [§ V2-1 ceiling](#v2-1-ceiling-measured-2026-05-29). |
 | `v0.3.0-durability` | V3 | Journey FSM · DLQs · per-workspace queue isolation (implementation or design-doc-only depending on interview timing) |
 
 ## Reading

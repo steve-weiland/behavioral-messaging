@@ -177,7 +177,7 @@ services:
       OTEL_EXPORTER_OTLP_ENDPOINT: otel-collector:4317
       OTEL_METRICS_EXEMPLAR_FILTER: trace_based
       STUB_RECEIVER_URL: http://stub-receiver:8081
-      PREFETCH: "32"
+      PREFETCH: "${PREFETCH:-32}"
       PORT: "8082"
     ports:
       - "8092:8082"
