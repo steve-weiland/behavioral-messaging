@@ -48,6 +48,8 @@ import (
 	"github.com/steveweiland/behavioral-messaging/internal/eventstore"
 	"github.com/steveweiland/behavioral-messaging/internal/logsx"
 	"github.com/steveweiland/behavioral-messaging/internal/otelinit"
+	"github.com/steveweiland/behavioral-messaging/internal/peoplefeed"
+	"github.com/steveweiland/behavioral-messaging/internal/person"
 
 	"encoding/json"
 )
@@ -105,7 +107,40 @@ func main() {
 		log.Fatalf("amqp topology: %v", err)
 	}
 
-	processor := campaign.NewProcessor(db, httpClient, stubURL)
+	// V2-2c hot path. Default "cache": serve per-event campaign list +
+	// person attributes from in-process caches (no MySQL read per event).
+	// "mysql": the V1 direct-read path, kept as the A/B ceiling baseline.
+	var processor *campaign.Processor
+	switch envOr("CAMPAIGN_HOT_PATH", "cache") {
+	case "mysql":
+		processor = campaign.NewProcessor(db, httpClient, stubURL)
+		slog.Info("hot path: direct MySQL (baseline)")
+	default:
+		attrCache := campaign.NewAttrCache(db)
+		campCache := campaign.NewCampaignCache(db, envDuration("CAMPAIGN_CACHE_TTL", 5*time.Second))
+		processor = campaign.NewProcessorWithCaches(db, httpClient, stubURL, attrCache, campCache)
+
+		// Bind a per-replica ephemeral queue to the people.changes fanout
+		// BEFORE backfilling, so attribute changes during backfill are
+		// buffered (not lost). A unique queue per replica (not a shared
+		// name) means each replica receives every change — the cache stays
+		// complete even when campaign-worker scales out. In-order delivery
+		// + idempotent Set means a backfilled value is simply overwritten
+		// by any newer change that follows.
+		attrQueue, err := declareAttrFeedQueue(amqpCh)
+		if err != nil {
+			log.Fatalf("declare attr feed queue: %v", err)
+		}
+		if err := backfillAttrs(rootCtx, db, attrCache); err != nil {
+			log.Fatalf("attr backfill: %v", err)
+		}
+		if err := amqpx.Consume(rootCtx, amqpCh, attrQueue, prefetch, serviceName+".attrs", attrFeedHandler(attrCache)); err != nil {
+			log.Fatalf("consume %s: %v", attrQueue, err)
+		}
+		slog.Info("hot path: in-process caches",
+			slog.String("attr_feed_queue", attrQueue),
+			slog.Int("attrs_backfilled", attrCache.Len()))
+	}
 
 	workspaces, err := listWorkspaces(rootCtx, db)
 	if err != nil {
@@ -193,6 +228,60 @@ func listWorkspaces(ctx context.Context, db *sql.DB) ([]string, error) {
 		out = append(out, ws)
 	}
 	return out, rows.Err()
+}
+
+// declareAttrFeedQueue ensures the people.changes exchange and binds a
+// per-replica ephemeral queue (server-named, exclusive, auto-delete) so
+// this worker receives every attribute change. Returns the queue name.
+func declareAttrFeedQueue(ch *amqp.Channel) (string, error) {
+	if err := peoplefeed.DeclareExchange(ch); err != nil {
+		return "", err
+	}
+	q, err := ch.QueueDeclare("", false /*durable*/, true /*autoDelete*/, true /*exclusive*/, false, nil)
+	if err != nil {
+		return "", err
+	}
+	if err := ch.QueueBind(q.Name, "", peoplefeed.Exchange, false, nil); err != nil {
+		return "", err
+	}
+	return q.Name, nil
+}
+
+// backfillAttrs primes the attribute cache from current MySQL state.
+func backfillAttrs(ctx context.Context, db *sql.DB, cache *campaign.AttrCache) error {
+	people, err := person.All(ctx, db)
+	if err != nil {
+		return err
+	}
+	for _, p := range people {
+		cache.Set(p.WorkspaceID, p.PersonID, p.Attributes)
+	}
+	return nil
+}
+
+// attrFeedHandler keeps the attribute cache current from people.changes.
+// Decode failure is a terminal drop (Ack — no DLQ on this feed); the
+// cache is best-effort with a MySQL fallback-on-miss.
+func attrFeedHandler(cache *campaign.AttrCache) amqpx.Handler {
+	return func(ctx context.Context, d amqp.Delivery) amqpx.Outcome {
+		var c peoplefeed.Change
+		if err := json.Unmarshal(d.Body, &c); err != nil {
+			slog.ErrorContext(ctx, "campaign-worker: bad people change body, dropping",
+				slog.String("message_id", d.MessageId), slog.Any("error", err))
+			return amqpx.OutcomeAck
+		}
+		cache.Set(c.WorkspaceID, c.PersonID, c.Attributes)
+		return amqpx.OutcomeAck
+	}
+}
+
+func envDuration(k string, def time.Duration) time.Duration {
+	if v := os.Getenv(k); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return def
 }
 
 func openDBWithRetry(dsn string, total time.Duration) (*sql.DB, error) {

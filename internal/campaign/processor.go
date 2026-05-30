@@ -34,11 +34,23 @@ type Processor struct {
 	httpClient *http.Client
 	stubURL    string
 	dispatched metric.Int64Counter
+
+	// V2-2c hot-path caches. When nil, Process reads MySQL directly per
+	// event (the V1 path — kept as the A/B baseline via CAMPAIGN_HOT_PATH=
+	// mysql). When set, the per-event ListByWorkspace + person.Get reads
+	// are served from memory.
+	campaignCache *CampaignCache
+	attrCache     *AttrCache
 }
 
-// NewProcessor wires the deps + initializes the dispatched counter
-// on the global meter.
+// NewProcessor wires the deps with the direct-MySQL hot path (no caches).
 func NewProcessor(db *sql.DB, hc *http.Client, stubURL string) *Processor {
+	return NewProcessorWithCaches(db, hc, stubURL, nil, nil)
+}
+
+// NewProcessorWithCaches wires the deps and (optionally) the V2-2c
+// in-process caches. Nil caches fall back to direct MySQL reads.
+func NewProcessorWithCaches(db *sql.DB, hc *http.Client, stubURL string, attrs *AttrCache, campaigns *CampaignCache) *Processor {
 	m := otel.Meter("campaigns")
 	dispatched, err := m.Int64Counter(
 		"campaign_dispatched_total",
@@ -48,11 +60,29 @@ func NewProcessor(db *sql.DB, hc *http.Client, stubURL string) *Processor {
 		panic(fmt.Errorf("campaign dispatched counter: %w", err))
 	}
 	return &Processor{
-		db:         db,
-		httpClient: hc,
-		stubURL:    stubURL,
-		dispatched: dispatched,
+		db:            db,
+		httpClient:    hc,
+		stubURL:       stubURL,
+		dispatched:    dispatched,
+		campaignCache: campaigns,
+		attrCache:     attrs,
 	}
+}
+
+// listCampaigns and getPerson resolve from the cache when configured,
+// else straight from MySQL (the V1 hot path).
+func (p *Processor) listCampaigns(ctx context.Context, workspaceID string) ([]Campaign, error) {
+	if p.campaignCache != nil {
+		return p.campaignCache.List(ctx, workspaceID)
+	}
+	return ListByWorkspace(ctx, p.db, workspaceID)
+}
+
+func (p *Processor) getPerson(ctx context.Context, workspaceID, personID string) (*person.Person, error) {
+	if p.attrCache != nil {
+		return p.attrCache.Get(ctx, workspaceID, personID)
+	}
+	return person.Get(ctx, p.db, workspaceID, personID)
 }
 
 // Process is the per-event consumer body. Wrapped in a `campaign.process`
@@ -82,9 +112,9 @@ func (p *Processor) Process(parent context.Context, ev event.Event) amqpx.Outcom
 	)
 	defer span.End()
 
-	// Pull all campaigns for the workspace. V1 reads on every event;
-	// V2-2 caches.
-	campaigns, err := ListByWorkspace(ctx, p.db, ev.WorkspaceID)
+	// Pull all campaigns for the workspace. V2-2c serves this from the
+	// in-process cache when configured; otherwise reads MySQL per event.
+	campaigns, err := p.listCampaigns(ctx, ev.WorkspaceID)
 	if err != nil {
 		slog.ErrorContext(ctx, "campaign list failed",
 			slog.String("workspace_id", ev.WorkspaceID),
@@ -96,7 +126,7 @@ func (p *Processor) Process(parent context.Context, ev event.Event) amqpx.Outcom
 		return amqpx.OutcomeAck
 	}
 
-	per, err := person.Get(ctx, p.db, ev.WorkspaceID, ev.PersonID)
+	per, err := p.getPerson(ctx, ev.WorkspaceID, ev.PersonID)
 	if errors.Is(err, person.ErrNotFound) {
 		// EnsureExists on the producer side should make this near-
 		// impossible; if it does happen, the person row was deleted

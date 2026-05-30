@@ -15,7 +15,7 @@ changed, what now breaks" writeup with hardware-pinned measurements.
 | | |
 |--|--|
 | **Spec** | [`spec.md`](./spec.md) — RFC-2119 V1 + V2 + V3 requirements |
-| **Status** | `v0.2.0-throughput` + V2-2 in progress. V1 foundation + V2-1 RabbitMQ async fan-out live (ceiling **~2,800 events/s, zero loss (~14× V1)** — see [§ V2-1 ceiling](#v2-1-ceiling-measured-2026-05-29)). V2-2: roaring-bitmap `segment-worker` shipped — `/segments/{id}/check` now served from incrementally-maintained bitmaps, no MySQL scan (next: repoint the campaign-worker trigger eval at it + re-measure). |
+| **Status** | `v0.2.0-throughput` + V2-2 in progress. V1 foundation + V2-1 RabbitMQ async fan-out live (ceiling **~2,800 events/s, zero loss (~14× V1)** — see [§ V2-1 ceiling](#v2-1-ceiling-measured-2026-05-29)). V2-2: roaring-bitmap `segment-worker` serves `/check` (no MySQL scan), and the campaign-worker hot path now reads campaigns + attributes from in-process caches — the fan-out worker is no longer the bottleneck (backlog 9,134 → 83), which **migrated to shared MySQL write throughput** ([§ V2-2 ceiling](#v2-2-hot-path-ceiling-measured-2026-05-29)). |
 | **Stack** | Go 1.25 · MySQL 8.0 · OpenTelemetry SDK + Collector 0.151 · Tempo 2.10 · Prometheus 3.11 · Loki 3.7 · Grafana Alloy v1.16 · Grafana 13.0 · `docker compose` |
 
 ---
@@ -180,7 +180,40 @@ close) dropped worker CPU 1,320%→240% and raised fan-out +70%
 (1,675→2,880/s) with zero errors. This is the V2-1 "what broke and how I
 fixed it" story.
 
+### V2-2 hot-path ceiling (measured 2026-05-29)
 
+V2-2 moves the campaign-worker's per-event work off MySQL: campaign
+definitions come from a TTL cache, person attributes from an in-process
+cache fed by `people.changes` (+ boot backfill), so `Process` no longer
+does `ListByWorkspace` + `person.Get` per event. The enrollment `INSERT`
+(the audit write) stays. A/B on the same binary via `CAMPAIGN_HOT_PATH`,
+`chaos/ceiling-run.sh`, c=100/200 @ 60s:
+
+| Hot path | Intake | Worker fan-out | Peak backlog | Worker CPU | MySQL CPU |
+|---|---|---|---|---|---|
+| `mysql` (V1 reads, c=100) | 2,593/s | ~2,500/s, lagging | **9,134** | 224% | 324% |
+| `cache` (c=100) | 2,662/s | keeps pace | **83** | 185% | 318% |
+| `cache` (c=200) | 2,715/s (flat) | keeps pace | 507 | 145% | 306% |
+
+**The fan-out worker is no longer the bottleneck.** Removing its two
+per-event reads collapsed the queue backlog **9,134 → 83** — it now drains
+as fast as intake delivers — and dropped its CPU (224% → 145%). Peak
+throughput barely moved, and that's the finding: doubling concurrency
+(c=100 → 200) doesn't raise it (2,662 → 2,715/s, latency doubles), while
+worker (145%) and track-api (130%) both have CPU headroom and **MySQL is
+pinned (~306%)**. The bottleneck migrated from the worker's per-event MySQL
+**reads** to the **shared single MySQL's write throughput** — every event
+is now one event `INSERT` (intake) + one enrollment `INSERT` (fan-out)
+competing for one MySQL. The next lever is write-side: separate read/write
+instances, batch enrollment inserts, or shard (V3/V4).
+
+**Tradeoff (deliberate):** dropping the per-event `person.Get` trades
+strong consistency (every event saw attributes as of that instant) for
+**eventual** consistency — an event just after an attribute change may
+evaluate the pre-change value until `people.changes` propagates. A cache
+miss falls back to one `person.Get`, so a brand-new person is never
+silently missed; only a very-recently-changed value is briefly stale. The
+cold `/check` path is unchanged (still `backend=bitmap`).
 
 | URL | What |
 |---|---|
@@ -285,7 +318,7 @@ or log shipping. Day-1 dashboards.
 | `v0.1.6-amqp` | V2 PR 6 | RabbitMQ infra + `internal/amqpx/` + `campaigns.fanout` topology declared at track-api startup. Dispatch path unchanged. |
 | `v0.1.7-fanout` | V2 PR 7 (this commit) | Atomic switch — `Dispatcher` retired, `Publisher` publishes per accepted event to `campaigns.fanout` (routing_key=workspace_id), new `cmd/campaign-worker/` consumes per-workspace queues with manual ack + DLQ on terminal nack. End-to-end trace continuity verified. 10 s burst @ c=5 = 345 events/s with 0 publish drops, 0 DLQ messages, queue depth = 0. |
 | `v0.2.0-throughput` | V2 PR 8 (tagged) | V2-1 ceiling re-measured on the same hardware — fan-out **~2,800/s, zero loss (~14× V1's 196/s)**, new bottleneck named (per-event MySQL over the 25-conn pool). New Go `cmd/loadgen/` + `chaos/watch-fanout.sh` + `chaos/ceiling-run.sh`. Found + fixed two Go HTTP connection-leak bugs that were masking the ceiling. See [§ V2-1 ceiling](#v2-1-ceiling-measured-2026-05-29). |
-| `v0.2.x-segments` | V2 PRs 9–10 | V2-2 roaring bitmaps. PR 9: `internal/segmentidx` engine (9 tests). PR 10: `cmd/segment-worker/` (backfill + stream maintenance + membership API) + `/check` repoint + `people.changes` feed. `make seed-segments` verifies the bitmap path end-to-end. **Next:** repoint campaign-worker's per-event trigger eval at the engine (lifts the V2-1 MySQL ceiling) + re-measure. |
+| `v0.2.x-segments` | V2 PRs 9–11 | V2-2. PR 9: `internal/segmentidx` engine (9 tests). PR 10: `cmd/segment-worker/` + `/check` repoint + `people.changes` feed. PR 11: campaign-worker hot-path repoint — campaign + attribute caches replace the per-event MySQL reads. Re-measured: worker backlog 9,134 → 83, ceiling migrated to shared MySQL writes ([§ V2-2 ceiling](#v2-2-hot-path-ceiling-measured-2026-05-29)). **Next:** write-side (read/write split, batch enrollment inserts, or shard). |
 | `v0.3.0-durability` | V3 | Journey FSM · DLQs · per-workspace queue isolation (implementation or design-doc-only depending on interview timing) |
 
 ## Reading

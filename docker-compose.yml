@@ -179,6 +179,7 @@ services:
       OTEL_METRICS_EXEMPLAR_FILTER: trace_based
       STUB_RECEIVER_URL: http://stub-receiver:8081
       PREFETCH: "${PREFETCH:-32}"
+      CAMPAIGN_HOT_PATH: "${CAMPAIGN_HOT_PATH:-cache}"
       PORT: "8082"
     ports:
       - "8092:8082"
