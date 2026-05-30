@@ -3,6 +3,7 @@ module github.com/steveweiland/behavioral-messaging
 go 1.25.0
 
 require (
+	github.com/RoaringBitmap/roaring/v2 v2.18.2
 	github.com/go-sql-driver/mysql v1.10.0
 	github.com/google/uuid v1.6.0
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.68.0
@@ -12,6 +13,11 @@ require (
 	go.opentelemetry.io/otel/sdk v1.43.0
 	go.opentelemetry.io/otel/sdk/metric v1.43.0
 	go.opentelemetry.io/otel/trace v1.43.0
+)
+
+require (
+	github.com/bits-and-blooms/bitset v1.24.2 // indirect
+	github.com/mschoch/smat v0.2.0 // indirect
 )
 
 require (
