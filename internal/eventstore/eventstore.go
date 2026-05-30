@@ -11,6 +11,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
+	"strconv"
 
 	_ "github.com/go-sql-driver/mysql" // registers "mysql" sql driver
 
@@ -27,9 +29,20 @@ func Open(dsn string) (*sql.DB, error) {
 		db.Close()
 		return nil, fmt.Errorf("ping: %w", err)
 	}
-	// Modest pool defaults for V1; we'll tune in V2 when fan-out arrives.
-	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(5)
+	// Pool size: default 50, overridable via MYSQL_MAX_OPEN_CONNS. The
+	// V2-2 write-ceiling diagnostic showed the old default of 25 throttled
+	// fan-out by ~30% (intake 2,173 → 2,836/s, p99 306 → 197ms going
+	// 25 → 64) — requests queued on the pool before MySQL. 50 banks most
+	// of that while keeping pool×3 services under MySQL's max_connections.
+	// Idle == open to keep connections warm under sustained load.
+	maxOpen := 50
+	if v := os.Getenv("MYSQL_MAX_OPEN_CONNS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			maxOpen = n
+		}
+	}
+	db.SetMaxOpenConns(maxOpen)
+	db.SetMaxIdleConns(maxOpen)
 	return db, nil
 }
 

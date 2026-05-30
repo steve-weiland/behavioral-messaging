@@ -43,6 +43,9 @@ services:
     command:
       - --default-authentication-plugin=caching_sha2_password
       - --innodb-buffer-pool-size=256M
+      # Headroom for the V2-2 pool bump: 3 services × 50 conns = 150 would
+      # sit on top of MySQL's 151 default. 300 leaves comfortable margin.
+      - --max-connections=300
     healthcheck:
       test: ["CMD-SHELL", "mysqladmin ping -ubm -pbm --silent || exit 1"]
       interval: 5s
@@ -135,6 +138,7 @@ services:
       OTEL_METRICS_EXEMPLAR_FILTER: trace_based
       STUB_RECEIVER_URL: http://stub-receiver:8081
       SEGMENT_INDEX_URL: http://segment-worker:8083
+      MYSQL_MAX_OPEN_CONNS: "${MYSQL_MAX_OPEN_CONNS:-50}"
       PORT: "8080"
     ports:
       - "8090:8080"
@@ -180,6 +184,7 @@ services:
       STUB_RECEIVER_URL: http://stub-receiver:8081
       PREFETCH: "${PREFETCH:-32}"
       CAMPAIGN_HOT_PATH: "${CAMPAIGN_HOT_PATH:-cache}"
+      MYSQL_MAX_OPEN_CONNS: "${MYSQL_MAX_OPEN_CONNS:-50}"
       PORT: "8082"
     ports:
       - "8092:8082"
