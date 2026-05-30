@@ -134,6 +134,7 @@ services:
       OTEL_EXPORTER_OTLP_ENDPOINT: otel-collector:4317
       OTEL_METRICS_EXEMPLAR_FILTER: trace_based
       STUB_RECEIVER_URL: http://stub-receiver:8081
+      SEGMENT_INDEX_URL: http://segment-worker:8083
       PORT: "8080"
     ports:
       - "8090:8080"
@@ -181,6 +182,33 @@ services:
       PORT: "8082"
     ports:
       - "8092:8082"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+
+  # V2-2: segment-worker owns the roaring-bitmap index. Backfills from
+  # MySQL at boot, then maintains bitmaps from the event stream
+  # (campaigns.fanout) + the people.changes feed. Serves membership over
+  # HTTP so track-api's /segments/{id}/check no longer scans MySQL.
+  segment-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: segment-worker
+    environment:
+      MYSQL_DSN: "bm:bm@tcp(mysql:3306)/bm?parseTime=true&multiStatements=true"
+      AMQP_URL: amqp://guest:guest@rabbitmq:5672/
+      OTEL_EXPORTER_OTLP_ENDPOINT: otel-collector:4317
+      OTEL_METRICS_EXEMPLAR_FILTER: trace_based
+      PREFETCH: "${SEGMENT_PREFETCH:-32}"
+      PORT: "8083"
+    ports:
+      - "8093:8083"
     depends_on:
       mysql:
         condition: service_healthy

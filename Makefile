@@ -99,6 +99,7 @@ seed-segments: ## Define active_pro + two people + check membership before/after
 		-d '{"person_id":"p_bob","attributes":{"plan":"free"}}' http://localhost:8090/people > /dev/null && echo "  p_bob   ok"
 	@echo
 	@echo "3. check membership BEFORE event (expect both false)"
+	@sleep 1   # bitmap index is eventually consistent — let people.changes propagate
 	@printf "  alice: "; curl -fsS -H 'X-Workspace-ID: ws_alpha' 'http://localhost:8090/segments/active_pro/check?person_id=p_alice'; echo
 	@printf "  bob:   "; curl -fsS -H 'X-Workspace-ID: ws_alpha' 'http://localhost:8090/segments/active_pro/check?person_id=p_bob'; echo
 	@echo
@@ -109,6 +110,7 @@ seed-segments: ## Define active_pro + two people + check membership before/after
 		-d '{"person_id":"p_bob","event_name":"viewed_pricing","payload":{}}' http://localhost:8090/events > /dev/null && echo "  p_bob   ok"
 	@echo
 	@echo "5. check membership AFTER event (expect alice true, bob false)"
+	@sleep 1   # let the viewed_pricing events propagate through campaigns.fanout to the index
 	@printf "  alice: "; curl -fsS -H 'X-Workspace-ID: ws_alpha' 'http://localhost:8090/segments/active_pro/check?person_id=p_alice'; echo
 	@printf "  bob:   "; curl -fsS -H 'X-Workspace-ID: ws_alpha' 'http://localhost:8090/segments/active_pro/check?person_id=p_bob'; echo
 

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -16,6 +18,7 @@ import (
 	"github.com/steveweiland/behavioral-messaging/internal/campaign"
 	"github.com/steveweiland/behavioral-messaging/internal/event"
 	"github.com/steveweiland/behavioral-messaging/internal/eventstore"
+	"github.com/steveweiland/behavioral-messaging/internal/peoplefeed"
 	"github.com/steveweiland/behavioral-messaging/internal/person"
 	"github.com/steveweiland/behavioral-messaging/internal/segment"
 )
@@ -79,6 +82,16 @@ type defineCampaignRequest struct {
 type server struct {
 	db        *sql.DB
 	publisher *campaign.Publisher
+
+	// V2-2: set by main(). When peopleFeed is non-nil, POST /people
+	// publishes the merged attributes so segment-worker can maintain its
+	// bitmaps. When segmentIndexURL is non-empty, /check delegates
+	// membership to segment-worker (bitmaps) and falls back to the V1
+	// scan only if the index is unavailable. Both zero-valued in unit
+	// tests, so the scan path stays exercised with no broker/worker.
+	peopleFeed      *peoplefeed.Publisher
+	segmentIndexURL string
+	indexClient     *http.Client
 }
 
 func newServer(db *sql.DB, pub *campaign.Publisher) *server {
@@ -147,9 +160,43 @@ func (s *server) handlePeoplePost(w http.ResponseWriter, r *http.Request) {
 		slog.String("workspace_id", workspace),
 		slog.String("person_id", req.PersonID),
 		slog.Int("bytes", len(req.Attributes)))
+
+	// V2-2: stream the person's FULL merged attributes to segment-worker
+	// so it can maintain the bitmap index. Best-effort: the index is
+	// eventually consistent, so a publish failure logs and does not fail
+	// the request. Re-reads the row to get the post-merge-patch state
+	// (Upsert returns nothing).
+	s.publishPersonChange(r.Context(), workspace, req.PersonID)
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	_, _ = w.Write([]byte(`{"status":"ok"}`))
+}
+
+// publishPersonChange re-reads the merged person row and publishes it to
+// the people.changes feed. No-op when the feed is not wired (unit tests).
+func (s *server) publishPersonChange(ctx context.Context, workspace, personID string) {
+	if s.peopleFeed == nil {
+		return
+	}
+	p, err := person.Get(ctx, s.db, workspace, personID)
+	if err != nil {
+		slog.WarnContext(ctx, "person change feed: re-read failed, skipping publish",
+			slog.String("workspace_id", workspace),
+			slog.String("person_id", personID),
+			slog.Any("error", err))
+		return
+	}
+	if err := s.peopleFeed.Publish(ctx, peoplefeed.Change{
+		WorkspaceID: workspace,
+		PersonID:    personID,
+		Attributes:  p.Attributes,
+	}); err != nil {
+		slog.WarnContext(ctx, "person change feed: publish failed",
+			slog.String("workspace_id", workspace),
+			slog.String("person_id", personID),
+			slog.Any("error", err))
+	}
 }
 
 // V1 PR 2: GET /people/{person_id} — read one person back. 404 if absent.
@@ -250,6 +297,56 @@ func (s *server) handleSegmentsPost(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(`{"status":"ok"}`))
 }
 
+// indexCheckRequest/Response is the membership contract with
+// segment-worker's POST /internal/check. track-api supplies the
+// definition it already loaded (so the worker needs no segment store);
+// the worker answers from its bitmaps.
+type indexCheckRequest struct {
+	WorkspaceID string          `json:"workspace_id"`
+	PersonID    string          `json:"person_id"`
+	Definition  json.RawMessage `json:"definition"`
+}
+
+type indexCheckResponse struct {
+	Member bool `json:"member"`
+}
+
+// checkViaIndex asks segment-worker whether personID is a member of the
+// segment defined by def. Returns ok=false on any error (transport,
+// non-200, decode) so the caller can fall back to the scan path.
+func (s *server) checkViaIndex(ctx context.Context, workspace, personID string, def json.RawMessage) (member bool, ok bool) {
+	body, err := json.Marshal(indexCheckRequest{
+		WorkspaceID: workspace, PersonID: personID, Definition: def,
+	})
+	if err != nil {
+		return false, false
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost,
+		s.segmentIndexURL+"/internal/check", bytes.NewReader(body))
+	if err != nil {
+		return false, false
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := s.indexClient.Do(req)
+	if err != nil {
+		return false, false
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
+	if resp.StatusCode != http.StatusOK {
+		return false, false
+	}
+	var out indexCheckResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return false, false
+	}
+	return out.Member, true
+}
+
 // V1 PR 3: GET /segments/{id} and /segments/{id}/check.
 // net/http's ServeMux doesn't pattern-match path segments before
 // Go 1.22; we route on a trimmed suffix instead.
@@ -295,6 +392,27 @@ func (s *server) handleSegmentsGet(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, "person_id query parameter required")
 			return
 		}
+		// V2-2: delegate membership to segment-worker's bitmap index.
+		// rec already proves the segment exists (404 handled above), so
+		// the index call is pure membership — no per-person event scan.
+		if s.segmentIndexURL != "" {
+			if member, ok := s.checkViaIndex(r.Context(), workspace, personID, rec.Definition); ok {
+				slog.InfoContext(r.Context(), "segment check",
+					slog.String("workspace_id", workspace),
+					slog.String("segment_id", segmentID),
+					slog.String("person_id", personID),
+					slog.Bool("member", member),
+					slog.String("backend", "bitmap"))
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(segmentCheckResponse{
+					WorkspaceID: workspace, SegmentID: segmentID, PersonID: personID, Member: member,
+				})
+				return
+			}
+			slog.WarnContext(r.Context(), "segment index unavailable, falling back to scan",
+				slog.String("segment_id", segmentID),
+				slog.String("person_id", personID))
+		}
 		p, err := person.Get(r.Context(), s.db, workspace, personID)
 		if errors.Is(err, person.ErrNotFound) {
 			// A person that doesn't exist is, by definition, not a member.
@@ -336,6 +454,7 @@ func (s *server) handleSegmentsGet(w http.ResponseWriter, r *http.Request) {
 			slog.String("segment_id", segmentID),
 			slog.String("person_id", personID),
 			slog.Bool("member", member),
+			slog.String("backend", "scan"),
 			slog.Int("events_scanned", len(events)))
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(segmentCheckResponse{

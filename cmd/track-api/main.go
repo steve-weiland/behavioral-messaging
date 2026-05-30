@@ -35,6 +35,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -45,6 +46,7 @@ import (
 	"github.com/steveweiland/behavioral-messaging/internal/eventstore"
 	"github.com/steveweiland/behavioral-messaging/internal/logsx"
 	"github.com/steveweiland/behavioral-messaging/internal/otelinit"
+	"github.com/steveweiland/behavioral-messaging/internal/peoplefeed"
 )
 
 const serviceName = "track-api"
@@ -94,6 +96,30 @@ func main() {
 	defer publisher.Stop()
 
 	srv := newServer(db, publisher)
+
+	// V2-2: the people.changes feed keeps segment-worker's bitmap index
+	// current. Its own dedicated channel (amqp091 channels are
+	// single-goroutine; the campaign Publisher owns amqpCh). And /check
+	// delegates membership to segment-worker when SEGMENT_INDEX_URL is set.
+	peopleCh, err := amqpConn.Channel()
+	if err != nil {
+		log.Fatalf("amqp people-feed channel: %v", err)
+	}
+	defer peopleCh.Close()
+	peopleFeed, err := peoplefeed.NewPublisher(peopleCh)
+	if err != nil {
+		log.Fatalf("people feed: %v", err)
+	}
+	srv.peopleFeed = peopleFeed
+	srv.segmentIndexURL = strings.TrimRight(envOr("SEGMENT_INDEX_URL", ""), "/")
+	srv.indexClient = &http.Client{
+		Timeout:   3 * time.Second,
+		Transport: otelhttp.NewTransport(http.DefaultTransport),
+	}
+	if srv.segmentIndexURL != "" {
+		slog.Info("segment /check delegating to bitmap index",
+			slog.String("segment_index_url", srv.segmentIndexURL))
+	}
 	mux := http.NewServeMux()
 	srv.routes(mux)
 

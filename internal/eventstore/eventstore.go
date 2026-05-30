@@ -52,6 +52,37 @@ func Insert(ctx context.Context, db *sql.DB, e event.Event) error {
 	return nil
 }
 
+// PersonEvent is one (workspace, person, event_name) triple — the only
+// fields event_seen membership needs.
+type PersonEvent struct {
+	WorkspaceID string
+	PersonID    string
+	Name        string
+}
+
+// DistinctPersonEvents streams every distinct (workspace, person,
+// event_name) for the segment-worker's boot backfill of the eventSeen
+// bitmaps. DISTINCT because event_seen is "ever", not a count — one row
+// per (person, event_name) is all the index needs, however many times
+// the event fired.
+func DistinctPersonEvents(ctx context.Context, db *sql.DB) ([]PersonEvent, error) {
+	const q = `SELECT DISTINCT workspace_id, person_id, event_name FROM events`
+	rows, err := db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("select distinct events: %w", err)
+	}
+	defer rows.Close()
+	var out []PersonEvent
+	for rows.Next() {
+		var pe PersonEvent
+		if err := rows.Scan(&pe.WorkspaceID, &pe.PersonID, &pe.Name); err != nil {
+			return nil, fmt.Errorf("scan person event: %w", err)
+		}
+		out = append(out, pe)
+	}
+	return out, rows.Err()
+}
+
 // RecentByPerson returns the most recent N events for a person, newest
 // first. Used by the V1 scan-based segment evaluator to answer
 // `event_seen` predicates. V2's bitmap path obviates this — see V2 spec.

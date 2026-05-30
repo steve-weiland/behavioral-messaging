@@ -69,6 +69,30 @@ func Upsert(ctx context.Context, db *sql.DB, workspaceID, personID string, attrs
 	return nil
 }
 
+// All streams every person row (all workspaces) for the segment-worker's
+// boot backfill — it rebuilds the attribute bitmaps from current state
+// before consuming the live people.changes feed. Only the fields the
+// index needs are selected.
+func All(ctx context.Context, db *sql.DB) ([]Person, error) {
+	const q = `SELECT workspace_id, person_id, attributes FROM people`
+	rows, err := db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("select people: %w", err)
+	}
+	defer rows.Close()
+	var out []Person
+	for rows.Next() {
+		var p Person
+		var attrs []byte
+		if err := rows.Scan(&p.WorkspaceID, &p.PersonID, &attrs); err != nil {
+			return nil, fmt.Errorf("scan person: %w", err)
+		}
+		p.Attributes = json.RawMessage(attrs)
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 // Get reads one person row. Returns ErrNotFound if missing.
 func Get(ctx context.Context, db *sql.DB, workspaceID, personID string) (*Person, error) {
 	const q = `

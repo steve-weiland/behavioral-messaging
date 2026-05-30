@@ -239,9 +239,31 @@ worker CPU 1,320%→240%, fan-out +70% (1,675→2,880/s), zero errors.
 
 #### 3.2.2 V2-2 — Roaring bitmaps for segment evaluation (BM‑90..99)
 
-*Drafted at V2-2 PR time. Maps to interview question: "Scale segment
-evaluation to 10M users." Upstream `github.com/RoaringBitmap/roaring`,
-not from-scratch primitives (Q4).*
+Maps to the interview question "Scale segment evaluation to 10M users."
+Upstream `github.com/RoaringBitmap/roaring/v2`, not from-scratch
+primitives (Q4). Inverts V1's *compute-on-read* scan to
+*maintain-on-write* bitmaps.
+
+| ID | Requirement |
+|----|-------------|
+| `BM‑90` | A bitmap engine (`internal/segmentidx`) **MUST** maintain, per workspace, base bitmaps of dense person ordinals: `eventSeen[name]`, `attrEq[key␀value]`, `attrExists[key]`. Membership **MUST** be answered by walking the existing `segment.Condition` tree with bitmap-backed leaves (`not` = negation; unknown person = non-member, preserving the BM‑35 `/check` contract). |
+| `BM‑91` | Maintenance **MUST** be incremental: one bit flipped per event / attribute change. Attribute updates **MUST** move the bit (clear the old value); deletes **MUST** clear it. `Observe*` **MUST** be idempotent so at-least-once redelivery is safe. |
+| `BM‑92` | A new `cmd/segment-worker/` service **MUST** own the index. At boot it **MUST** backfill from current MySQL state (`person.All` + `eventstore.DistinctPersonEvents`); then maintain from two streams — events via its own per-workspace queue on `campaigns.fanout` (`segments.index.<ws>`, distinct from the campaign queue so it gets a copy, not a steal), and attribute changes via the `people.changes` feed (BM‑94). |
+| `BM‑93` | segment-worker **MUST** expose `POST /internal/check {workspace_id, person_id, definition}` → `{member}`, answering purely from bitmaps (the caller supplies the definition, so the read path needs no segment store). |
+| `BM‑94` | `track-api` `POST /people` **MUST** publish the person's full merged attributes to a `people.changes` fanout exchange — deliberately OFF the high-throughput `/events` path so attribute indexing never regresses intake throughput. Best-effort: a publish failure logs and does not fail the request (the index is eventually consistent). |
+| `BM‑95` | `track-api` `/segments/{id}/check` **MUST** delegate membership to segment-worker when `SEGMENT_INDEX_URL` is set, removing the per-person `RecentByPerson` event scan. It **MUST** fall back to the V1 scan if the index is unavailable, and **MUST** log which backend served the check. |
+| `BM‑96` | The engine's `event_seen` is "ever," vs the V1 scan's last-`segmentScanEventLimit` window — strictly more complete. Documented as a deliberate semantic refinement, not a regression. |
+| `BM‑97` | The new ceiling **MUST** be re-measured (the V2-1 bottleneck was per-event MySQL on the worker fan-out path; V2-2 moves segment/trigger evaluation off MySQL). Expected new bottleneck: bitmap memory + render CPU per workspace. *(Re-measure pending — fan-out trigger eval still inline in campaign-worker; see Lessons.)* |
+
+**V2-2a/b status (2026-05-29):** engine (`internal/segmentidx`, BM‑90/91)
+and segment-worker + `/check` repoint + `people.changes` feed (BM‑92..96)
+shipped and verified end-to-end via `make seed-segments` — all checks
+served `backend=bitmap`, zero scan fallbacks. **Not yet done:** the
+campaign-worker's per-event *trigger* evaluation still calls
+`ListByWorkspace` + inline `cond.Evaluate` against MySQL — repointing
+*that* at the bitmap engine is what actually lifts the V2-1 ~2,800/s
+ceiling (BM‑97). This slice de-risked the engine on the isolated `/check`
+read surface first; the hot-path repoint + re-measure is the next slice.
 
 #### 3.2.3 V2-3 — Idempotency keys + two-phase dispatch (BM‑100..109)
 
@@ -470,5 +492,7 @@ bottleneck-migration narrative with hardware-pinned numbers.
 | 0.1.4   | 2026-05-21 | Steve Weiland | Spelling sweep: British → American. Schema rename `journey_enrolments` → `journey_enrollments`, column `enrolment_id` → `enrollment_id`, indexes `idx_enrolments_*` → `idx_enrollments_*` (`enrolled_at` kept — past-tense spelling is identical in both dialects). Go identifiers `EnrolmentID`/`enrolID`/`insertEnrolment` retitled. Prose `behaviour`/`behavioural`/`enrol(s)` retitled across spec/README/comments. No behavior change; live MySQL needs a one-time `RENAME TABLE` (or `make down -v && make up` reset). |
 | 0.1.5   | 2026-05-21 | Steve Weiland | V1 PR 5 closes V1: `chaos/load-v1.sh` (bash+curl closed-loop driver, `make load-{prep,quick,soak}`); soak measured 568 events/s intake, ~196 events/s fan-out, ~69% drop at the in-process channel. Bottleneck named: single Dispatcher consumer doing four serial MySQL hops + one sync HTTP per event. §3.2 V2 — Throughput rewritten: V2-1 RabbitMQ async fan-out spelled out as `BM‑80..89` (per-workspace queues from day 1, durable + manual-ack, DLQ topology established, V2-1 writeup names the new ceiling); V2-2 + V2-3 stubbed for their PR time. README gains the V1 ceiling section with hardware banner. |
 | 0.1.6   | 2026-05-21 | Steve Weiland | V2 PR 6 (V2-1a infra): RabbitMQ 3.13 added to compose; `internal/amqpx/` lifted from Build 5 (Connect/Publish/Consume + W3C traceparent over AMQP headers + Outcome enum + consume duration/dropped metrics); `internal/campaign/topology.go` declares `campaigns.fanout` (direct) + `campaigns.fanout.dlx` (fanout) + `campaigns.fanout.dlq` (durable, bound to DLX) at track-api startup. Dispatch path unchanged — broker is wired but unused. |
+| 0.2.3   | 2026-05-29 | Steve Weiland | V2 PR 10 (V2-2b): `cmd/segment-worker/` — boot backfill (`person.All` + `eventstore.DistinctPersonEvents`) + incremental maintenance from `campaigns.fanout` (own `segments.index.<ws>` queues) and the new `people.changes` feed; `POST /internal/check` membership API. track-api repointed `/segments/{id}/check` at it (`SEGMENT_INDEX_URL`) with scan fallback + `backend` log, and publishes merged attributes on `POST /people`. BM‑92..96. Verified via `make seed-segments` (all `backend=bitmap`). §3.2.2 filled. |
+| 0.2.2   | 2026-05-29 | Steve Weiland | V2 PR 9 (V2-2a): `internal/segmentidx` roaring-bitmap engine — base bitmaps (eventSeen / attrEq / attrExists), incremental `Observe*` (move-on-update, clear-on-delete), `Member` over the `segment.Condition` tree with bitmap leaves, unknown-person-non-member. 9 tests. BM‑90/91. Adds `RoaringBitmap/roaring/v2`. |
 | 0.2.1   | 2026-05-29 | Steve Weiland | V2 PR 8 (V2-1 ceiling): re-measured fan-out on the same hardware with a new Go driver (`cmd/loadgen/`) + live fan-out sampling (`chaos/watch-fanout.sh`, `chaos/ceiling-run.sh`). Closes BM‑87/88 — new ceiling **~2,800/s fan-out, zero loss (~14× V1)**, bottleneck named as per-event MySQL over the 25-conn pool (BM‑88 "MySQL connection-pool contention" candidate confirmed). Two latent Go HTTP connection-leak bugs found + fixed en route (default transport pool; undrained response body → ephemeral-port exhaustion under high `PREFETCH`); `PREFETCH` made host-tunable in compose. §3.2.1 gains the V2-1 ceiling + Lessons block; §6 tier table filled for V1 + V2-1. |
 | 0.2.0   | 2026-05-21 | Steve Weiland | V2 PR 7 (V2-1b switch): in-process `Dispatcher` retired; `Publisher` publishes per accepted event to `campaigns.fanout` with routing_key=workspace_id (goroutine + bounded retry — never blocks the HTTP reply, BM-89); new `cmd/campaign-worker/` consumes per-workspace queues (`PREFETCH`=32, manual ack) and runs `campaign.Processor.Process`. Outcomes: Ack on success/no-match; NackRequeue on transient infra failure; NackDrop on terminal (person row missing) — routes to DLQ via queue-level `x-dead-letter-exchange`. `campaign_queue_dropped_total` retired (BM-86); replaced with `campaign_publish_dropped_total{workspace_id,reason}` for buffer overflow / retry exhaustion / shutdown drops. Closes BM-80..86 + BM-89. Re-measurement (BM-87/88) lands in V2 PR 8. |

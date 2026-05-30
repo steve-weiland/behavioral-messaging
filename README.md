@@ -15,7 +15,7 @@ changed, what now breaks" writeup with hardware-pinned measurements.
 | | |
 |--|--|
 | **Spec** | [`spec.md`](./spec.md) — RFC-2119 V1 + V2 + V3 requirements |
-| **Status** | `v0.2.0-throughput`. V1 foundation shipped (six surfaces) + V2-1 RabbitMQ async fan-out live. V2-1 ceiling re-measured 2026-05-29: fan-out **~2,800 events/s, zero loss (~14× V1)** — see [§ V2-1 ceiling](#v2-1-ceiling-measured-2026-05-29). V1 baseline: [§ V1 ceiling](#v1-ceiling-on-this-hardware). |
+| **Status** | `v0.2.0-throughput` + V2-2 in progress. V1 foundation + V2-1 RabbitMQ async fan-out live (ceiling **~2,800 events/s, zero loss (~14× V1)** — see [§ V2-1 ceiling](#v2-1-ceiling-measured-2026-05-29)). V2-2: roaring-bitmap `segment-worker` shipped — `/segments/{id}/check` now served from incrementally-maintained bitmaps, no MySQL scan (next: repoint the campaign-worker trigger eval at it + re-measure). |
 | **Stack** | Go 1.25 · MySQL 8.0 · OpenTelemetry SDK + Collector 0.151 · Tempo 2.10 · Prometheus 3.11 · Loki 3.7 · Grafana Alloy v1.16 · Grafana 13.0 · `docker compose` |
 
 ---
@@ -189,7 +189,8 @@ fixed it" story.
 | `GET  http://localhost:8090/people/<id>` | Read one person back. *(V1 PR 2)* |
 | `POST http://localhost:8090/segments` | Define a segment with a JSON condition tree (`and`/`or`/`not` + `attr_eq`/`attr_exists`/`event_seen`). Depth cap 8. *(V1 PR 3)* |
 | `GET  http://localhost:8090/segments/<id>` | Read the stored definition. *(V1 PR 3)* |
-| `GET  http://localhost:8090/segments/<id>/check?person_id=<pid>` | Scan-eval membership for one person. V2's bitmap path removes the scan. *(V1 PR 3)* |
+| `GET  http://localhost:8090/segments/<id>/check?person_id=<pid>` | Membership for one person. **V2-2: served from `segment-worker`'s roaring bitmaps** (no MySQL event scan); falls back to the V1 scan if the index is down. *(V1 PR 3 → V2 PR 10)* |
+| http://localhost:8093/healthz | `segment-worker` (V2-2) — bitmap index; `POST /internal/check` membership API |
 | `POST http://localhost:8090/campaigns` | Define a campaign — trigger (same condition tree as segments) + Go `text/template` body. Validates at insert time. *(V1 PR 4)* |
 | `GET  http://localhost:8090/campaigns/<id>` | Read the stored campaign. *(V1 PR 4)* |
 | http://localhost:15672 (guest/guest) | RabbitMQ management UI — `campaigns.fanout` exchange, `campaigns.fanout.dlx` DLX, `campaigns.fanout.dlq` DLQ declared at track-api startup. *(V2 PR 6)* |
@@ -207,6 +208,7 @@ fixed it" story.
 | `track-api` | `:8090` | container `:8080`; host `8080` squatted |
 | `stub-receiver` | `:8091` | container `:8081` |
 | `campaign-worker` | `:8092` | container `:8082`; tiny `/healthz` only |
+| `segment-worker` | `:8093` | container `:8083`; `/healthz` + `POST /internal/check` (V2-2) |
 | MySQL | `:3307` | container `:3306`; host `:3306` left for any local MySQL |
 | RabbitMQ | `:5672` (AMQP), `:15672` (mgmt), `:15692` (Prom) | guest/guest creds; mgmt UI in browser |
 | OTel collector | `:4317` | OTLP/gRPC; Prom scrape `:8889` |
@@ -226,7 +228,7 @@ behavioral-messaging/
 │   ├── campaign-worker/            V2 PR 7 — consumes per-workspace queues, runs the per-event Processor
 │   ├── stub-receiver/              V1 delivery sink
 │   ├── campaign-worker/            V1.x — campaign trigger + render (added next PR)
-│   ├── segment-worker/             V2 — incremental bitmap segment maintenance
+│   ├── segment-worker/             V2-2 — bitmap index: boot backfill + stream maintenance + /internal/check
 │   ├── journey-scheduler/          V3 — SKIP-LOCKED scheduler
 │   └── loadgen/                    V1.x — Go load driver for scale ceiling runs
 ├── internal/
@@ -236,7 +238,9 @@ behavioral-messaging/
 │   ├── logsx/                      Build 5 carryover — slog JSON + trace_id/span_id
 │   ├── amqpx/                      V2 PR 6 — thin amqp091 wrapper (Connect/Publish/Consume + traceparent propagation)
 │   ├── person/                     V1.x — person store
-│   ├── segment/                    V1.x — condition tree parser; V2 — roaring bitmap engine
+│   ├── segment/                    V1.x — condition tree parser + scan evaluator
+│   ├── segmentidx/                 V2-2 — roaring bitmap engine (Observe* maintenance + Member)
+│   ├── peoplefeed/                 V2-2 — people.changes attribute-stream exchange + publisher
 │   ├── campaign/                   V1 PR 4 → V2 PR 7 — trigger + template + processor.go (per-event fan-out
 │   │                               body, returns amqpx.Outcome) + publisher.go (RabbitMQ producer with
 │   │                               goroutine + bounded retry) + topology.go (exchange/DLX/DLQ + per-workspace queue helper)
@@ -281,6 +285,7 @@ or log shipping. Day-1 dashboards.
 | `v0.1.6-amqp` | V2 PR 6 | RabbitMQ infra + `internal/amqpx/` + `campaigns.fanout` topology declared at track-api startup. Dispatch path unchanged. |
 | `v0.1.7-fanout` | V2 PR 7 (this commit) | Atomic switch — `Dispatcher` retired, `Publisher` publishes per accepted event to `campaigns.fanout` (routing_key=workspace_id), new `cmd/campaign-worker/` consumes per-workspace queues with manual ack + DLQ on terminal nack. End-to-end trace continuity verified. 10 s burst @ c=5 = 345 events/s with 0 publish drops, 0 DLQ messages, queue depth = 0. |
 | `v0.2.0-throughput` | V2 PR 8 (tagged) | V2-1 ceiling re-measured on the same hardware — fan-out **~2,800/s, zero loss (~14× V1's 196/s)**, new bottleneck named (per-event MySQL over the 25-conn pool). New Go `cmd/loadgen/` + `chaos/watch-fanout.sh` + `chaos/ceiling-run.sh`. Found + fixed two Go HTTP connection-leak bugs that were masking the ceiling. See [§ V2-1 ceiling](#v2-1-ceiling-measured-2026-05-29). |
+| `v0.2.x-segments` | V2 PRs 9–10 | V2-2 roaring bitmaps. PR 9: `internal/segmentidx` engine (9 tests). PR 10: `cmd/segment-worker/` (backfill + stream maintenance + membership API) + `/check` repoint + `people.changes` feed. `make seed-segments` verifies the bitmap path end-to-end. **Next:** repoint campaign-worker's per-event trigger eval at the engine (lifts the V2-1 MySQL ceiling) + re-measure. |
 | `v0.3.0-durability` | V3 | Journey FSM · DLQs · per-workspace queue isolation (implementation or design-doc-only depending on interview timing) |
 
 ## Reading
