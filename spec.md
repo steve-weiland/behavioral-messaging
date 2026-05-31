@@ -265,11 +265,28 @@ campaign-worker's per-event *trigger* evaluation still calls
 ceiling (BM‑97). This slice de-risked the engine on the isolated `/check`
 read surface first; the hot-path repoint + re-measure is the next slice.
 
-#### 3.2.3 V2-3 — Idempotency keys + two-phase dispatch (BM‑100..109)
+#### 3.2.3 V2-3 — Batched idempotent enrollment (BM‑100..109)
 
-*Drafted at V2-3 PR time. Maps to interview question: "Guarantee
-exactly-once email delivery." Closes the audit-failure-doesn't-reverse-
-dispatch gap from BM‑78.*
+Shipped as **Lean** (PR 13): batched, idempotent enrollment writes. The
+full two-phase send-gate is **deferred** — on a stub sink with a
+write-bound MySQL it adds writes for no payoff; it belongs with V3
+retry/DLQ when a real sender exists.
+
+| ID | Requirement |
+|----|-------------|
+| `BM‑100` | `journey_enrollments` **MUST** carry a UNIQUE natural key `(workspace_id, campaign_id, triggered_by)` (migration 004) — one row per (campaign, inbound event). The enrollment insert **MUST** be `ON DUPLICATE KEY UPDATE` (no-op), so an at-least-once redelivery never creates a duplicate. Partly closes BM‑78 (audit idempotency; double-*send* still possible — see BM‑105). |
+| `BM‑101` | The campaign-worker **MUST** coalesce enrollment inserts into one multi-row commit per flush (`internal/campaign/batcher.go`), bounded by `BATCH_MAX` rows or `BATCH_WINDOW` time — amortizing the per-commit fsync that made the fan-out write side the backlog-prone laggard. |
+| `BM‑102` | A dispatch **MUST** ack its AMQP delivery only after its enrollment batch has COMMITTED (Submit blocks on the flush). A flush error **MUST** nack-requeue the event; the idempotent insert (BM‑100) makes re-dispatch safe. Preserves BM‑84 at-least-once. |
+| `BM‑103` | Batching **MUST** be toggleable (`CAMPAIGN_BATCH=on\|off`) for A/B measurement; the off path inserts directly but is still idempotent (BM‑100). |
+| `BM‑105` (deferred) | Two-phase send-gate via `idempotency_keys` (`sending` → POST → `sent`) to close the double-*send* window for a real downstream. Deferred — revisit with V3 retry/DLQ. |
+
+**Measured (PR 13, fresh DB, pool 50, prefetch 128, c=200):** with batching
+the fan-out write side keeps pace — peak queue backlog **166**; without it,
+backlog **156,961** (each enrollment its own commit). Coalescing ran at
+~63.5 rows/flush (cap 64). Zero duplicate enrollments across 700k+ rows.
+*(Absolute intake here ~5,750/s is higher than PR 11's ~2,700/s because
+this is a fresh DB — small tables/indexes insert faster; the valid
+comparison is batching-on-vs-off backlog, not the absolute number.)*
 
 ### 3.3 V3 — Durability
 
@@ -492,6 +509,7 @@ bottleneck-migration narrative with hardware-pinned numbers.
 | 0.1.4   | 2026-05-21 | Steve Weiland | Spelling sweep: British → American. Schema rename `journey_enrolments` → `journey_enrollments`, column `enrolment_id` → `enrollment_id`, indexes `idx_enrolments_*` → `idx_enrollments_*` (`enrolled_at` kept — past-tense spelling is identical in both dialects). Go identifiers `EnrolmentID`/`enrolID`/`insertEnrolment` retitled. Prose `behaviour`/`behavioural`/`enrol(s)` retitled across spec/README/comments. No behavior change; live MySQL needs a one-time `RENAME TABLE` (or `make down -v && make up` reset). |
 | 0.1.5   | 2026-05-21 | Steve Weiland | V1 PR 5 closes V1: `chaos/load-v1.sh` (bash+curl closed-loop driver, `make load-{prep,quick,soak}`); soak measured 568 events/s intake, ~196 events/s fan-out, ~69% drop at the in-process channel. Bottleneck named: single Dispatcher consumer doing four serial MySQL hops + one sync HTTP per event. §3.2 V2 — Throughput rewritten: V2-1 RabbitMQ async fan-out spelled out as `BM‑80..89` (per-workspace queues from day 1, durable + manual-ack, DLQ topology established, V2-1 writeup names the new ceiling); V2-2 + V2-3 stubbed for their PR time. README gains the V1 ceiling section with hardware banner. |
 | 0.1.6   | 2026-05-21 | Steve Weiland | V2 PR 6 (V2-1a infra): RabbitMQ 3.13 added to compose; `internal/amqpx/` lifted from Build 5 (Connect/Publish/Consume + W3C traceparent over AMQP headers + Outcome enum + consume duration/dropped metrics); `internal/campaign/topology.go` declares `campaigns.fanout` (direct) + `campaigns.fanout.dlx` (fanout) + `campaigns.fanout.dlq` (durable, bound to DLX) at track-api startup. Dispatch path unchanged — broker is wired but unused. |
+| 0.2.5   | 2026-05-31 | Steve Weiland | V2 PR 13 (V2-3 Lean): batched idempotent enrollment. Migration 004 adds UNIQUE `(workspace_id, campaign_id, triggered_by)` → `INSERT … ON DUPLICATE KEY UPDATE` makes redelivery a no-op (BM‑100, partly closes BM‑78). New `internal/campaign/batcher.go` coalesces enrollment inserts into one multi-row commit per flush (`BATCH_MAX`/`BATCH_WINDOW`); Submit blocks until commit then acks (BM‑101/102). `CAMPAIGN_BATCH` A/B toggle (BM‑103). Measured: backlog 156,961 → 166 with batching; 0 duplicate enrollments across 700k+ rows. Two-phase send-gate deferred (BM‑105). §3.2.3 filled. |
 | 0.2.4   | 2026-05-29 | Steve Weiland | V2 PR 11 (V2-2c): campaign-worker hot-path repoint. New `internal/campaign/attrcache.go` (attributes from `people.changes` + boot backfill + MySQL fallback-on-miss) and `campaigncache.go` (per-workspace TTL list); `Processor` reads both from cache instead of per-event `ListByWorkspace` + `person.Get`. Per-replica ephemeral queue on the people.changes fanout keeps the cache complete at N replicas. `CAMPAIGN_HOT_PATH=cache\|mysql` escape hatch for A/B. Closes BM‑97 — worker backlog 9,134→83, ceiling migrated to shared-MySQL writes. Trade: per-event attribute reads become eventually consistent (fallback-on-miss bounds it). |
 | 0.2.3   | 2026-05-29 | Steve Weiland | V2 PR 10 (V2-2b): `cmd/segment-worker/` — boot backfill (`person.All` + `eventstore.DistinctPersonEvents`) + incremental maintenance from `campaigns.fanout` (own `segments.index.<ws>` queues) and the new `people.changes` feed; `POST /internal/check` membership API. track-api repointed `/segments/{id}/check` at it (`SEGMENT_INDEX_URL`) with scan fallback + `backend` log, and publishes merged attributes on `POST /people`. BM‑92..96. Verified via `make seed-segments` (all `backend=bitmap`). §3.2.2 filled. |
 | 0.2.2   | 2026-05-29 | Steve Weiland | V2 PR 9 (V2-2a): `internal/segmentidx` roaring-bitmap engine — base bitmaps (eventSeen / attrEq / attrExists), incremental `Observe*` (move-on-update, clear-on-delete), `Member` over the `segment.Condition` tree with bitmap leaves, unknown-person-non-member. 9 tests. BM‑90/91. Adds `RoaringBitmap/roaring/v2`. |

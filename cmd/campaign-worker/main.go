@@ -110,15 +110,13 @@ func main() {
 	// V2-2c hot path. Default "cache": serve per-event campaign list +
 	// person attributes from in-process caches (no MySQL read per event).
 	// "mysql": the V1 direct-read path, kept as the A/B ceiling baseline.
-	var processor *campaign.Processor
-	switch envOr("CAMPAIGN_HOT_PATH", "cache") {
-	case "mysql":
-		processor = campaign.NewProcessor(db, httpClient, stubURL)
+	var attrCache *campaign.AttrCache
+	var campCache *campaign.CampaignCache
+	if envOr("CAMPAIGN_HOT_PATH", "cache") == "mysql" {
 		slog.Info("hot path: direct MySQL (baseline)")
-	default:
-		attrCache := campaign.NewAttrCache(db)
-		campCache := campaign.NewCampaignCache(db, envDuration("CAMPAIGN_CACHE_TTL", 5*time.Second))
-		processor = campaign.NewProcessorWithCaches(db, httpClient, stubURL, attrCache, campCache)
+	} else {
+		attrCache = campaign.NewAttrCache(db)
+		campCache = campaign.NewCampaignCache(db, envDuration("CAMPAIGN_CACHE_TTL", 5*time.Second))
 
 		// Bind a per-replica ephemeral queue to the people.changes fanout
 		// BEFORE backfilling, so attribute changes during backfill are
@@ -141,6 +139,23 @@ func main() {
 			slog.String("attr_feed_queue", attrQueue),
 			slog.Int("attrs_backfilled", attrCache.Len()))
 	}
+
+	// V2-3 enrollment batching (default on). Coalesces journey_enrollments
+	// inserts into batched, idempotent commits — fewer fsyncs, no backlog
+	// under write pressure. "off" uses direct (still idempotent) inserts,
+	// the A/B baseline. Stop() (flush) is deferred before db.Close (LIFO).
+	var batcher *campaign.Batcher
+	if envOr("CAMPAIGN_BATCH", "on") != "off" {
+		maxRows := envInt("BATCH_MAX", 64)
+		batcher = campaign.NewBatcher(db, maxRows, envDuration("BATCH_WINDOW", 10*time.Millisecond))
+		batcher.Start()
+		defer batcher.Stop()
+		slog.Info("enrollment batching enabled", slog.Int("batch_max", maxRows))
+	} else {
+		slog.Info("enrollment batching disabled (direct inserts)")
+	}
+
+	processor := campaign.NewProcessorWithCaches(db, httpClient, stubURL, attrCache, campCache, batcher)
 
 	workspaces, err := listWorkspaces(rootCtx, db)
 	if err != nil {

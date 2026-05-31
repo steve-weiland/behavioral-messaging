@@ -15,7 +15,7 @@ changed, what now breaks" writeup with hardware-pinned measurements.
 | | |
 |--|--|
 | **Spec** | [`spec.md`](./spec.md) — RFC-2119 V1 + V2 + V3 requirements |
-| **Status** | `v0.2.0-throughput` + V2-2 in progress. V1 foundation + V2-1 RabbitMQ async fan-out live (ceiling **~2,800 events/s, zero loss (~14× V1)** — see [§ V2-1 ceiling](#v2-1-ceiling-measured-2026-05-29)). V2-2: roaring-bitmap `segment-worker` serves `/check` (no MySQL scan), and the campaign-worker hot path now reads campaigns + attributes from in-process caches — the fan-out worker is no longer the bottleneck (backlog 9,134 → 83), which **migrated to shared MySQL write throughput** ([§ V2-2 ceiling](#v2-2-hot-path-ceiling-measured-2026-05-29)). |
+| **Status** | `v0.2.0-throughput` + V2-2 in progress. V1 foundation + V2-1 RabbitMQ async fan-out live (ceiling **~2,800 events/s, zero loss (~14× V1)** — see [§ V2-1 ceiling](#v2-1-ceiling-measured-2026-05-29)). `v0.2.5` tagged (V2-2 complete). V2-2: roaring-bitmap `segment-worker` serves `/check` (no MySQL scan) + campaign-worker hot path reads from in-process caches — fan-out worker stopped being the bottleneck (backlog 9,134 → 83), which **migrated to shared MySQL write throughput** ([§ V2-2 ceiling](#v2-2-hot-path-ceiling-measured-2026-05-29)). V2-3: batched idempotent enrollment — keeps the write side from backing up (backlog 156,961 → 166) and makes at-least-once redelivery a no-op. |
 | **Stack** | Go 1.25 · MySQL 8.0 · OpenTelemetry SDK + Collector 0.151 · Tempo 2.10 · Prometheus 3.11 · Loki 3.7 · Grafana Alloy v1.16 · Grafana 13.0 · `docker compose` |
 
 ---
@@ -277,10 +277,12 @@ behavioral-messaging/
 │   ├── campaign/                   V1 PR 4 → V2 PR 7 — trigger + template + processor.go (per-event fan-out
 │   │                               body, returns amqpx.Outcome) + publisher.go (RabbitMQ producer with
 │   │                               goroutine + bounded retry) + topology.go (exchange/DLX/DLQ + per-workspace queue helper)
+│   │                               + attrcache.go / campaigncache.go (V2-2c hot-path caches) + batcher.go (V2-3 batched
+│   │                               idempotent enrollment inserts)
 │   └── journey/                    V3 — FSM with delays
 ├── deploy/                         Build 5 carryover — collector/tempo/prom/loki/alloy/grafana
 │   └── grafana/provisioning/dashboards/ — red.json + use.json (panels TBD-rewritten for MySQL)
-├── migrations/                     001_v1.sql (workspaces, people, events, journey_enrollments, idempotency_keys) · 002_segments.sql · 003_campaigns.sql
+├── migrations/                     001_v1.sql (workspaces, people, events, journey_enrollments, idempotency_keys) · 002_segments.sql · 003_campaigns.sql · 004_idempotency.sql (unique enrollment key)
 └── chaos/                          load-v1.sh (bash V1 driver) · watch-fanout.sh (live backlog+CPU sampler) ·
                                     ceiling-run.sh (V2 measured-run orchestrator; pairs with cmd/loadgen/)
 ```
@@ -319,6 +321,7 @@ or log shipping. Day-1 dashboards.
 | `v0.1.7-fanout` | V2 PR 7 (this commit) | Atomic switch — `Dispatcher` retired, `Publisher` publishes per accepted event to `campaigns.fanout` (routing_key=workspace_id), new `cmd/campaign-worker/` consumes per-workspace queues with manual ack + DLQ on terminal nack. End-to-end trace continuity verified. 10 s burst @ c=5 = 345 events/s with 0 publish drops, 0 DLQ messages, queue depth = 0. |
 | `v0.2.0-throughput` | V2 PR 8 (tagged) | V2-1 ceiling re-measured on the same hardware — fan-out **~2,800/s, zero loss (~14× V1's 196/s)**, new bottleneck named (per-event MySQL over the 25-conn pool). New Go `cmd/loadgen/` + `chaos/watch-fanout.sh` + `chaos/ceiling-run.sh`. Found + fixed two Go HTTP connection-leak bugs that were masking the ceiling. See [§ V2-1 ceiling](#v2-1-ceiling-measured-2026-05-29). |
 | `v0.2.x-segments` | V2 PRs 9–11 | V2-2. PR 9: `internal/segmentidx` engine (9 tests). PR 10: `cmd/segment-worker/` + `/check` repoint + `people.changes` feed. PR 11: campaign-worker hot-path repoint — campaign + attribute caches replace the per-event MySQL reads. Re-measured: worker backlog 9,134 → 83, ceiling migrated to shared MySQL writes ([§ V2-2 ceiling](#v2-2-hot-path-ceiling-measured-2026-05-29)). **Next:** write-side (read/write split, batch enrollment inserts, or shard). |
+| `v0.2.x-idempotency` | V2 PR 13 | V2-3 (Lean): migration 004 unique `(workspace_id, campaign_id, triggered_by)` + `INSERT … ON DUPLICATE KEY UPDATE` → redelivery never double-enrolls; `internal/campaign/batcher.go` coalesces enrollment inserts (~63 rows/flush). Backlog 156,961 → 166; 0 dup enrollments across 700k+ rows. Two-phase send-gate deferred to V3. |
 | `v0.3.0-durability` | V3 | Journey FSM · DLQs · per-workspace queue isolation (implementation or design-doc-only depending on interview timing) |
 
 ## Reading

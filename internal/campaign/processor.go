@@ -41,16 +41,23 @@ type Processor struct {
 	// are served from memory.
 	campaignCache *CampaignCache
 	attrCache     *AttrCache
+
+	// V2-3 enrollment batcher. When nil, enrollments insert directly (one
+	// commit each); when set, they coalesce into batched commits. Either
+	// way the insert is idempotent (uniq_enrollment_dispatch).
+	batcher *Batcher
 }
 
-// NewProcessor wires the deps with the direct-MySQL hot path (no caches).
+// NewProcessor wires the deps with the direct-MySQL hot path (no caches,
+// no batcher).
 func NewProcessor(db *sql.DB, hc *http.Client, stubURL string) *Processor {
-	return NewProcessorWithCaches(db, hc, stubURL, nil, nil)
+	return NewProcessorWithCaches(db, hc, stubURL, nil, nil, nil)
 }
 
 // NewProcessorWithCaches wires the deps and (optionally) the V2-2c
-// in-process caches. Nil caches fall back to direct MySQL reads.
-func NewProcessorWithCaches(db *sql.DB, hc *http.Client, stubURL string, attrs *AttrCache, campaigns *CampaignCache) *Processor {
+// in-process caches + V2-3 enrollment batcher. Nil caches fall back to
+// direct MySQL reads; a nil batcher inserts enrollments directly.
+func NewProcessorWithCaches(db *sql.DB, hc *http.Client, stubURL string, attrs *AttrCache, campaigns *CampaignCache, batcher *Batcher) *Processor {
 	m := otel.Meter("campaigns")
 	dispatched, err := m.Int64Counter(
 		"campaign_dispatched_total",
@@ -66,7 +73,17 @@ func NewProcessorWithCaches(db *sql.DB, hc *http.Client, stubURL string, attrs *
 		dispatched:    dispatched,
 		campaignCache: campaigns,
 		attrCache:     attrs,
+		batcher:       batcher,
 	}
+}
+
+// recordEnrollment durably records one dispatch — via the batcher when
+// configured, else a direct idempotent insert.
+func (p *Processor) recordEnrollment(ctx context.Context, r enrollRow) error {
+	if p.batcher != nil {
+		return p.batcher.Submit(ctx, r)
+	}
+	return insertEnrollment(ctx, p.db, r.workspaceID, r.enrollmentID, r.campaignID, r.personID, r.triggeredBy)
 }
 
 // listCampaigns and getPerson resolve from the cache when configured,
@@ -146,11 +163,13 @@ func (p *Processor) Process(parent context.Context, ev event.Event) amqpx.Outcom
 		return amqpx.OutcomeNackRequeue
 	}
 
-	// For each campaign whose trigger matches, render + dispatch + audit.
-	// Per-campaign failures are logged but don't fail the whole event —
-	// V1 best-effort semantics preserved. V2-3 will introduce
-	// idempotency keys so a single failed dispatch can be retried
-	// without re-firing the ones that already succeeded.
+	// For each campaign whose trigger matches, render + dispatch + record.
+	// Render/dispatch failures are logged and skipped (best-effort). An
+	// enrollment-record failure is durable-state we can't drop, so it
+	// requeues the whole event — safe now that the insert is idempotent
+	// (uniq_enrollment_dispatch): re-dispatched campaigns re-enroll as
+	// no-ops, only the stub re-POSTs (harmless for the stub sink).
+	requeue := false
 	for i := range campaigns {
 		c := &campaigns[i]
 		if !p.triggerMatches(ctx, c, per, ev) {
@@ -173,12 +192,19 @@ func (p *Processor) Process(parent context.Context, ev event.Event) amqpx.Outcom
 			span.RecordError(err)
 			continue
 		}
-		if err := insertEnrollment(ctx, p.db, ev.WorkspaceID, enrollID, c.CampaignID, ev.PersonID, ev.EventID); err != nil {
-			slog.ErrorContext(ctx, "enrollment audit insert failed",
+		if err := p.recordEnrollment(ctx, enrollRow{
+			workspaceID:  ev.WorkspaceID,
+			enrollmentID: enrollID,
+			campaignID:   c.CampaignID,
+			personID:     ev.PersonID,
+			triggeredBy:  ev.EventID,
+		}); err != nil {
+			slog.ErrorContext(ctx, "enrollment record failed — requeueing event",
 				slog.String("campaign_id", c.CampaignID),
 				slog.Any("error", err))
 			span.RecordError(err)
-			// Audit failure doesn't reverse the dispatch — V2-1 acceptable.
+			requeue = true
+			continue
 		}
 		p.dispatched.Add(ctx, 1,
 			metric.WithAttributes(
@@ -190,6 +216,9 @@ func (p *Processor) Process(parent context.Context, ev event.Event) amqpx.Outcom
 			slog.String("person_id", ev.PersonID),
 			slog.String("event_id", ev.EventID),
 			slog.String("enrollment_id", enrollID))
+	}
+	if requeue {
+		return amqpx.OutcomeNackRequeue
 	}
 	return amqpx.OutcomeAck
 }
@@ -262,9 +291,12 @@ func (p *Processor) dispatch(ctx context.Context, c *Campaign, per *person.Perso
 }
 
 func insertEnrollment(ctx context.Context, db *sql.DB, workspaceID, enrollID, campaignID, personID, triggerEventID string) error {
+	// Idempotent on uniq_enrollment_dispatch (migration 004): a redelivered
+	// (workspace, campaign, event) is a no-op rather than a duplicate row.
 	const q = `
 		INSERT INTO journey_enrollments (workspace_id, enrollment_id, campaign_id, person_id, triggered_by)
 		VALUES (?, ?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE enrollment_id = enrollment_id
 	`
 	if _, err := db.ExecContext(ctx, q, workspaceID, enrollID, campaignID, personID, triggerEventID); err != nil {
 		return fmt.Errorf("insert journey_enrollment: %w", err)
