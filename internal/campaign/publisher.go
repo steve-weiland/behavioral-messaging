@@ -66,6 +66,12 @@ const publisherBufferSize = 1024
 // NewPublisher wires the deps + initializes the publisher metrics.
 // Start() must be called before Submit() to spin up the publish worker.
 func NewPublisher(ch *amqp.Channel) *Publisher {
+	return newPublisher(ch, publisherBufferSize)
+}
+
+// newPublisher is NewPublisher with an injectable buffer size, so the
+// drop-on-full path is testable without enqueuing 1024 events.
+func newPublisher(ch *amqp.Channel, bufSize int) *Publisher {
 	m := otel.Meter("campaigns")
 	dropped, err := m.Int64Counter(
 		"campaign_publish_dropped_total",
@@ -83,7 +89,7 @@ func NewPublisher(ch *amqp.Channel) *Publisher {
 	}
 	return &Publisher{
 		amqpCh:         ch,
-		ch:             make(chan publishJob, publisherBufferSize),
+		ch:             make(chan publishJob, bufSize),
 		done:           make(chan struct{}),
 		publishDropped: dropped,
 		bufferDepth:    depth,
@@ -134,12 +140,22 @@ func (p *Publisher) Submit(reqCtx context.Context, ev event.Event) {
 		context.Background(),
 		trace.SpanContextFromContext(reqCtx),
 	)
+	// Shutdown is checked FIRST, in its own select. Folding it in as a third
+	// case alongside `p.ch <- job` would make the two cases ready
+	// simultaneously after Stop — and select picks uniformly at random, so
+	// ~half of those events would land in a buffer nothing drains and be
+	// counted as neither drop reason. Silent loss is the exact V1 bug this
+	// producer replaced, so shutdown gets deterministic precedence.
 	select {
 	case <-p.done:
 		p.recordDrop(reqCtx, ev, "shutdown")
 		slog.WarnContext(reqCtx, "publisher stopping — dropping event",
 			slog.String("workspace_id", ev.WorkspaceID),
 			slog.String("event_id", ev.EventID))
+		return
+	default:
+	}
+	select {
 	case p.ch <- publishJob{parentCtx: parent, ev: ev, body: body}:
 		p.bufferDepth.Add(reqCtx, 1)
 	default:
@@ -148,6 +164,9 @@ func (p *Publisher) Submit(reqCtx context.Context, ev event.Event) {
 			slog.String("workspace_id", ev.WorkspaceID),
 			slog.String("event_id", ev.EventID))
 	}
+	// Residual (benign): Stop can close done between the check and the
+	// enqueue. That event is still published — run()'s shutdown branch drains
+	// the buffer before returning — so it's a late success, not a loss.
 }
 
 func (p *Publisher) recordDrop(ctx context.Context, ev event.Event, reason string) {

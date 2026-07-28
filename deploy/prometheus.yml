@@ -1,6 +1,5 @@
-# Prometheus config — scrape the collector's Prometheus exporter only.
-# RabbitMQ scrape was carried over from Build 5 but V1 of this stack
-# doesn't run RabbitMQ — re-introduce when V2 lands fan-out.
+# Prometheus config — app metrics via the collector's Prometheus exporter,
+# plus RabbitMQ's own per-queue metrics (V2-1 onward).
 global:
   scrape_interval: 15s
   evaluation_interval: 15s
@@ -12,3 +11,46 @@ scrape_configs:
   - job_name: otel-collector
     static_configs:
       - targets: ["otel-collector:8889"]
+
+  # BM-82: per-workspace queue depth + processing rate, attributed by
+  # workspace_id. The app can't emit queue depth honestly — the broker owns
+  # it, and the whole point of V2-1 is that the backlog lives outside the
+  # process. So scrape RabbitMQ directly.
+  #
+  # /metrics is aggregated across all queues, which loses exactly the
+  # per-workspace dimension the requirement asks for. /metrics/detailed with
+  # the queue_coarse_metrics family emits one series per queue; our queues are
+  # named campaigns.fanout.<workspace_id> and segments.index.<workspace_id>,
+  # so a relabel lifts workspace_id out of the queue name.
+  #
+  # Useful series after this lands:
+  #   rabbitmq_detailed_queue_messages_ready{workspace_id="ws_alpha"}   → backlog
+  #   rate(rabbitmq_detailed_queue_messages_published_total[1m])        → publish rate
+  #   rate(rabbitmq_detailed_queue_messages_delivered_total[1m])        → drain rate
+  # This is what chaos/watch-fanout.sh had to poll the management API for.
+  - job_name: rabbitmq
+    metrics_path: /metrics/detailed
+    params:
+      family:
+        - queue_coarse_metrics
+        - queue_consumer_count
+    static_configs:
+      - targets: ["rabbitmq:15692"]
+    metric_relabel_configs:
+      # Lift the workspace out of the queue name for the two per-workspace
+      # families: campaigns.fanout.<ws> (fan-out) and segments.index.<ws>
+      # (bitmap maintenance).
+      - source_labels: [queue]
+        regex: '(?:campaigns\.fanout|segments\.index)\.(.+)'
+        target_label: workspace_id
+        replacement: '$1'
+      # …then clear it on the two queues that share those prefixes but are
+      # NOT workspaces: the single global DLQ and the segment-worker's
+      # people.changes consumer. Without this they'd appear as workspaces
+      # named "dlq" and "people". RE2 has no negative lookahead, so this is
+      # extract-then-clear rather than one exclusion regex; an empty
+      # replacement drops the label.
+      - source_labels: [queue]
+        regex: 'campaigns\.fanout\.dlq|segments\.index\.people'
+        target_label: workspace_id
+        replacement: ''

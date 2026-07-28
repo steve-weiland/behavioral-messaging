@@ -2,8 +2,8 @@
 
 COMPOSE ?= docker compose
 
-.PHONY: help up down logs ps rebuild test seed seed-people seed-segments seed-campaign showcase \
-	load-prep load-quick load-soak \
+.PHONY: help up down logs ps rebuild test fmt vet seed seed-people seed-segments seed-campaign showcase \
+	load load-prep load-quick load-soak \
 	mysql events-count people-count segments-count campaigns-count enrollments-count
 
 help:
@@ -26,6 +26,14 @@ rebuild: ## Rebuild + restart Go services only
 
 test: ## Run all Go unit tests (no docker required)
 	go test ./...
+
+fmt: ## gofmt the tree
+	gofmt -w cmd/ internal/
+
+vet: ## go vet
+	go vet ./...
+
+load: load-soak ## BM-52 alias — the standard ceiling-search run (= load-soak)
 
 load-prep: ## Pre-seed welcome_pro + 50 plan=pro people for load runs
 	WORKSPACE=ws_alpha PEOPLE=50 DURATION=0 ./chaos/load-v1.sh

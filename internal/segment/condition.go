@@ -7,15 +7,15 @@
 //
 // V1 supported ops:
 //
-//   Boolean: and / or / not
-//   Leaf:    attr_eq, attr_exists, event_seen (ever-in-this-workspace)
+//	Boolean: and / or / not
+//	Leaf:    attr_eq, attr_exists, event_seen (ever-in-this-workspace)
 //
 // Tree shape (serialized as JSON):
 //
-//   { "op": "and", "conditions": [
-//       { "op": "attr_eq",     "key": "plan", "value": "pro" },
-//       { "op": "event_seen",  "name": "viewed_pricing" }
-//   ] }
+//	{ "op": "and", "conditions": [
+//	    { "op": "attr_eq",     "key": "plan", "value": "pro" },
+//	    { "op": "event_seen",  "name": "viewed_pricing" }
+//	] }
 //
 // Depth is capped at 8 at validate-time to bound stack usage.
 package segment

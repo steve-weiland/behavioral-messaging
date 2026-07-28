@@ -175,7 +175,7 @@ func (p *Processor) Process(parent context.Context, ev event.Event) amqpx.Outcom
 		if !p.triggerMatches(ctx, c, per, ev) {
 			continue
 		}
-		rendered, err := renderTemplate(c.Template, per, ev)
+		rendered, err := renderCampaign(c, per, ev)
 		if err != nil {
 			slog.ErrorContext(ctx, "template render failed",
 				slog.String("campaign_id", c.CampaignID),
@@ -224,12 +224,19 @@ func (p *Processor) Process(parent context.Context, ev event.Event) amqpx.Outcom
 }
 
 func (p *Processor) triggerMatches(ctx context.Context, c *Campaign, per *person.Person, ev event.Event) bool {
-	cond, err := segment.DecodeCondition(c.Trigger)
-	if err != nil {
-		slog.ErrorContext(ctx, "stored trigger undecodable",
-			slog.String("campaign_id", c.CampaignID),
-			slog.Any("error", err))
-		return false
+	// Compiled by the cache layer when the hot path is cache-backed; decode
+	// inline otherwise (the CAMPAIGN_HOT_PATH=mysql baseline, and the
+	// fallback for a definition that failed to compile).
+	cond := c.cond
+	if cond == nil {
+		decoded, err := segment.DecodeCondition(c.Trigger)
+		if err != nil {
+			slog.ErrorContext(ctx, "stored trigger undecodable",
+				slog.String("campaign_id", c.CampaignID),
+				slog.Any("error", err))
+			return false
+		}
+		cond = &decoded
 	}
 	// EvalContext: the person + a single-event view containing just the
 	// inbound event. attr_eq looks at the person's attributes; event_seen
@@ -324,11 +331,27 @@ func ParseTemplate(name, body string) error {
 	return err
 }
 
+// renderCampaign renders a campaign's template, reusing the parsed template
+// cached on the Campaign when available (the hot path) and parsing inline
+// otherwise. Parsing per event is a measurable waste: the template is already
+// validated at POST time by ParseTemplate, and BM‑88 named render CPU as an
+// expected V2 bottleneck candidate.
+func renderCampaign(c *Campaign, per *person.Person, ev event.Event) (string, error) {
+	if c.tpl != nil {
+		return executeTemplate(c.tpl, per, ev)
+	}
+	return renderTemplate(c.Template, per, ev)
+}
+
 func renderTemplate(body string, per *person.Person, ev event.Event) (string, error) {
 	tpl, err := template.New("campaign").Option("missingkey=zero").Parse(body)
 	if err != nil {
 		return "", fmt.Errorf("parse template: %w", err)
 	}
+	return executeTemplate(tpl, per, ev)
+}
+
+func executeTemplate(tpl *template.Template, per *person.Person, ev event.Event) (string, error) {
 	var attrs map[string]any
 	if len(per.Attributes) > 0 {
 		if err := json.Unmarshal(per.Attributes, &attrs); err != nil {

@@ -1,11 +1,11 @@
 # Behavioral Messaging Platform
 
-| Field   | Value         |
-|---------|---------------|
-| Version | 0.2.0-draft (V2-1b shipped) |
-| Author  | Steve Weiland |
-| Date    | 2026-05-20    |
-| Status  | Draft         |
+| Field   | Value                                  |
+|---------|----------------------------------------|
+| Version | 0.2.6                                  |
+| Author  | Steve Weiland                          |
+| Date    | 2026-07-28                             |
+| Status  | V1 + V2 complete (V3 designed, unbuilt) |
 
 ---
 
@@ -26,7 +26,7 @@ changed, what now breaks" writeup with hardware-pinned measurements.
 | Tier | Mechanism shift | What V(n+1) addresses |
 |---|---|---|
 | **V1 Foundation** | Workspace-scoped from day one. Single-process per service, single MySQL, in-process channel queue, scan-based segment evaluation, sync stub dispatch. | Single-writer + sync-dispatch ceiling. |
-| **V2 Throughput** | Roaring bitmaps for segments (incremental membership maintenance) + RabbitMQ async fan-out + idempotency keys + two-phase dispatch. | Render CPU / bitmap memory per workspace. |
+| **V2 Throughput** | Roaring bitmaps for segments (incremental membership maintenance) + RabbitMQ async fan-out + batched idempotent enrollment. | **Measured: the single shared MySQL's write throughput** — one event `INSERT` + one enrollment `INSERT` per event competing for one instance. Not render CPU or bitmap memory, which were the pre-measurement guesses and are never reached while one MySQL gates writes. |
 | **V3 Durability** | Per-person journey state machine with delays (persisted FSM, `SELECT ... FOR UPDATE SKIP LOCKED` scheduler) + DLQs + retry semantics + per-workspace queue isolation. | Cross-workspace coordination overhead — V4 sharding territory. |
 
 Multi-tenancy is **not** a tier — it's a cross-cutting V1 property
@@ -46,7 +46,7 @@ Multi-tenancy is **not** a tier — it's a cross-cutting V1 property
 | Campaign | A trigger condition + a message template. V1: single-step send on event match. V3: multi-step journey with delays + branches. |
 | Journey enrollment | The audit record when a campaign enrolls a person, with `event_id` cross-reference. |
 | Stub receiver | V1's stand-in for a delivery provider (ESP / APNs / FCM / webhook). HTTP receiver that logs the payload. |
-| Idempotency key | `(workspace_id, person_id, campaign_id, schedule_key)` row guaranteeing at-most-once dispatch even under retry. V2 mechanism. |
+| Idempotency key | `(workspace_id, person_id, campaign_id, schedule_key)` row guaranteeing at-most-once *dispatch* even under retry. **Deferred to V3** (BM‑105) — the `idempotency_keys` table exists (BM‑13) but is unwritten. What V2-3 shipped instead is *enrollment* idempotency: a UNIQUE natural key on `journey_enrollments` making redelivery a no-op at the audit layer (BM‑100). Redelivery cannot double-enroll; it can still double-*send*. |
 
 ---
 
@@ -123,13 +123,19 @@ Requirements use [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) keywords:
 | `BM‑78` | A `journey_enrollments` row **MUST** be inserted on every successful dispatch with `(workspace_id, enrollment_id, campaign_id, person_id, triggered_by=event_id)`. Audit-insert failure after a successful HTTP dispatch **MUST NOT** reverse the dispatch — V1 acceptable; V2's two-phase dispatch closes this gap. |
 | `BM‑79` | The Dispatcher **MUST** publish `campaign_queue_dropped_total{workspace_id}` and `campaign_dispatched_total{workspace_id, campaign_id}` counters via the global OTel meter. The async `campaign.process` span **MUST** join the producer's trace by re-using the inbound event's span context (`trace.ContextWithSpanContext(context.Background(), ...)` so the consumer outlives the HTTP handler). |
 
-#### 3.1.4 Stub receiver
+#### 3.1.4d Stub receiver (V1 PR 1)
+
+*Renumbered from `BM‑30..32` to `BM‑43..45` (spec 0.2.6): those IDs were
+already taken by the segment store in §3.1.4b, so "BM‑31" referred to two
+different requirements and traceability broke. The section heading gained its
+`d` for the same reason — it sat between `3.1.4c` and `3.1.5` as a bare
+`3.1.4`.*
 
 | ID | Requirement |
 |----|-------------|
-| `BM‑30` | `stub-receiver` **MUST** expose `POST /` accepting any JSON body up to 64 KiB. |
-| `BM‑31` | The receiver **MUST** log one structured INFO line per delivery with `event_id` (when present) and `bytes`. |
-| `BM‑32` | The receiver **MUST** return `200 OK` with `{"received":true}` on every successful read. |
+| `BM‑43` | `stub-receiver` **MUST** expose `POST /` accepting any JSON body up to 64 KiB. |
+| `BM‑44` | The receiver **MUST** log one structured INFO line per delivery with `event_id` (when present) and `bytes`. |
+| `BM‑45` | The receiver **MUST** return `200 OK` with `{"received":true}` on every successful read. |
 
 #### 3.1.5 Observability
 
@@ -137,7 +143,7 @@ Requirements use [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) keywords:
 |----|-------------|
 | `BM‑40` | Both services **MUST** initialise tracing + metrics via `internal/otelinit.Init` (Build 5 reuse) and structured JSON logging via `internal/logsx.Init`. |
 | `BM‑41` | HTTP handlers **MUST** be wrapped in `otelhttp.NewHandler`. Outbound HTTP **MUST** use `otelhttp.NewTransport` so trace context propagates to `stub-receiver`. |
-| `BM‑42` | A single `POST /events` call **MUST** produce one connected trace in Tempo spanning `track-api` server span → MySQL connection (in V1.1 once otelsql is wired) → outbound HTTP client → `stub-receiver` server span. |
+| `BM‑42` | A single `POST /events` call **MUST** produce one connected trace in Tempo. **V1 shape:** `track-api` server span → outbound HTTP client → `stub-receiver` server span. **V2-1b shape (current):** `track-api` server span → `amqp.publish` → `amqp.consume` (campaign-worker) → `campaign.process` → outbound HTTP client → `stub-receiver` server span — track-api no longer dispatches, so the trace crosses the broker via W3C traceparent on the AMQP headers (`internal/amqpx/propagation.go`). MySQL spans are **still absent**: `otelsql` remains unwired (see §5), so the DB hops don't appear in either shape. |
 
 #### 3.1.6 Operational
 
@@ -145,7 +151,7 @@ Requirements use [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) keywords:
 |----|-------------|
 | `BM‑50` | Each service **MUST** handle `SIGTERM` with graceful shutdown (drain HTTP, flush OTel exporters, exit ≤ 10 s). |
 | `BM‑51` | All services **MUST** read connection settings (`MYSQL_DSN`, `OTEL_EXPORTER_OTLP_ENDPOINT`, `STUB_RECEIVER_URL`, `PORT`) from environment variables. |
-| `BM‑52` | A `Makefile` **MUST** expose targets `up`, `down`, `logs`, `seed`, `mysql`, `load`, `showcase` mirroring Build 5's surface. |
+| `BM‑52` | A `Makefile` **MUST** expose targets `up`, `down`, `logs`, `seed`, `mysql`, `load`, `showcase` mirroring Build 5's surface. (`load` is an alias for `load-soak`, the standard ceiling-search run; `load-prep` / `load-quick` are the other two modes.) |
 
 #### 3.1.7 V1 scale ceiling (target on this hardware)
 
@@ -179,11 +185,11 @@ it removes the V1 ceiling directly.
 |----|-------------|
 | `BM‑80` | The Dispatcher **MUST** publish each accepted event to a RabbitMQ exchange (`campaigns.fanout`) keyed by `workspace_id`. The producer-side `Submit(ctx, ev)` API **MUST NOT** change — V1's call site in `/events` is unchanged. |
 | `BM‑81` | A new `cmd/campaign-worker/` service **MUST** consume from per-workspace queues bound to `campaigns.fanout`. Default deployment: one worker container, configurable concurrency (`PREFETCH`, default 32). Multiple replicas **MUST** be safe (queues are competing-consumer; ack only after dispatch + audit). |
-| `BM‑82` | Per-workspace queue admission **MUST** be in place from V2-1, not deferred to V3. Concretely: one queue per workspace, named `campaigns.fanout.<workspace_id>`, bound to the exchange with `routing_key=<workspace_id>`. Per-workspace queue depth + processing rate **MUST** surface as Prometheus counters attributed by `workspace_id`. |
+| `BM‑82` | Per-workspace queue admission **MUST** be in place from V2-1, not deferred to V3. Concretely: one queue per workspace, named `campaigns.fanout.<workspace_id>`, bound to the exchange with `routing_key=<workspace_id>`. Per-workspace queue depth + processing rate **MUST** surface in Prometheus attributed by `workspace_id` — via the RabbitMQ scrape described in BM‑86. (The two queues sharing those prefixes that are *not* workspaces — the global `campaigns.fanout.dlq` and segment-worker's `segments.index.people` attribute feed — are excluded from the relabel so they don't appear as phantom workspaces.) |
 | `BM‑83` | Messages **MUST** be persistent (`delivery_mode=2`) and the queue **MUST** be durable. RabbitMQ restarts **MUST NOT** drop accepted events. |
 | `BM‑84` | Worker acks **MUST** be manual: ack only after `journey_enrollments` is written. nack-with-requeue on transient failure (MySQL connection error, stub timeout); reject-without-requeue on terminal failure (template render error, decode error). |
 | `BM‑85` | A DLQ (`campaigns.fanout.dlx`) **MUST** be wired but acceptably empty in V2-1. V3-2 introduces real retry-with-backoff semantics; V2-1 just establishes the topology so V3-2 is a config change, not a refactor. |
-| `BM‑86` | `campaign_queue_dropped_total` from V1 **MUST** be retired; in V2 the producer never drops — the broker provides backpressure. A new `campaign_queue_depth{workspace_id}` gauge replaces it. |
+| `BM‑86` | `campaign_queue_dropped_total` from V1 **MUST** be retired; in V2 the producer never drops for capacity reasons — the broker provides backpressure. Queue depth **MUST** be observable per workspace. **Amended (0.2.6):** this originally specified an app-emitted `campaign_queue_depth{workspace_id}` gauge. That was the wrong design — the broker owns the depth, and a gauge emitted by the producer would be a second source of truth that can disagree with the queue it claims to describe (the producer can't see what the worker has drained). Satisfied instead by scraping RabbitMQ: `rabbitmq_detailed_queue_messages_ready{workspace_id}`, with `workspace_id` relabeled out of the queue name (`deploy/prometheus.yml`). The producer's own in-process buffer is separately visible as `campaign_publish_buffer_depth`, and its drop reasons as `campaign_publish_dropped_total{workspace_id,reason}`. |
 | `BM‑87` | The new V2 ceiling **MUST** be measured with the same `chaos/load-v1.sh` driver re-run on the same hardware. Expected new bottleneck per BM‑88. |
 | `BM‑88` | The V2-1 writeup **MUST** name the new bottleneck. Expected candidates: render CPU on the worker; MySQL connection-pool contention from N parallel workers; broker publish throughput. |
 | `BM‑89` | The producer (`/events` handler) **MUST** continue to respond ≤ 1 hop after `eventstore.Insert` returns — broker publish runs in a goroutine with bounded retry, never blocks the HTTP reply. (This preserves V1's intake-throughput characteristic; the goal of V2 is to grow the fan-out rate, not slow the intake.) |
@@ -237,6 +243,24 @@ requested address`), ~73k failed dispatches, a nack-requeue storm, and a
 13-of-14-core CPU burn — with throughput going *down*. After both fixes:
 worker CPU 1,320%→240%, fan-out +70% (1,675→2,880/s), zero errors.
 
+**Lesson (found at close-out, 0.2.6) — a third silent-loss path, on the
+producer.** `Publisher.Submit` had three `select` cases: `<-p.done`
+(shutdown), `p.ch <- job` (enqueue), and `default` (buffer full). After
+`Stop()` closes `done`, the first two are *both* ready — and Go chooses
+uniformly at random among ready cases. So roughly half of any events
+submitted during shutdown were enqueued into a buffer that nothing would
+drain, and counted as neither `shutdown` nor `buffer_full`: exactly the
+silent drop V1's channel had, reintroduced in the mechanism built to remove
+it. Narrow in practice (track-api drains HTTP before stopping the publisher),
+but silent, and the fix is to check `done` in its own `select` first so
+shutdown has deterministic precedence.
+
+The reason this survived three PRs of measurement: every load run publishes
+into a *running* producer, so the shutdown race is never on the measured
+path. It surfaced the moment the first unit test asked what `Submit` does
+after `Stop` — a reminder that "we measured it at scale" and "we tested its
+edges" are different claims.
+
 #### 3.2.2 V2-2 — Roaring bitmaps for segment evaluation (BM‑90..99)
 
 Maps to the interview question "Scale segment evaluation to 10M users."
@@ -255,15 +279,34 @@ primitives (Q4). Inverts V1's *compute-on-read* scan to
 | `BM‑96` | The engine's `event_seen` is "ever," vs the V1 scan's last-`segmentScanEventLimit` window — strictly more complete. Documented as a deliberate semantic refinement, not a regression. |
 | `BM‑97` | The new ceiling **MUST** be re-measured (the V2-1 bottleneck was per-event MySQL on the worker fan-out path; V2-2 moves segment/trigger evaluation off MySQL). **Re-measured 2026-05-29 (PR 11):** the campaign-worker hot path now reads campaigns + attributes from in-process caches (no per-event `ListByWorkspace`/`person.Get`). Result: the fan-out worker stopped being the bottleneck — backlog **9,134 → 83**, worker CPU 224% → 145% — and the ceiling **migrated to the shared single MySQL's write throughput** (event `INSERT` + enrollment `INSERT` competing; ~2,700/s, flat under added concurrency, MySQL pinned ~306% while worker/track-api have headroom). Not bitmap memory / render CPU as originally guessed — those aren't reached while one MySQL gates writes. Next lever: read/write split, batch enrollment inserts, or shard (V3/V4). |
 
-**V2-2a/b status (2026-05-29):** engine (`internal/segmentidx`, BM‑90/91)
-and segment-worker + `/check` repoint + `people.changes` feed (BM‑92..96)
-shipped and verified end-to-end via `make seed-segments` — all checks
-served `backend=bitmap`, zero scan fallbacks. **Not yet done:** the
-campaign-worker's per-event *trigger* evaluation still calls
-`ListByWorkspace` + inline `cond.Evaluate` against MySQL — repointing
-*that* at the bitmap engine is what actually lifts the V2-1 ~2,800/s
-ceiling (BM‑97). This slice de-risked the engine on the isolated `/check`
-read surface first; the hot-path repoint + re-measure is the next slice.
+**V2-2 status (complete; a/b 2026-05-29, c PR 11).** The engine
+(`internal/segmentidx`, BM‑90/91) and segment-worker + `/check` repoint +
+`people.changes` feed (BM‑92..96) shipped and were verified end-to-end via
+`make seed-segments` — all checks served `backend=bitmap`, zero scan
+fallbacks. The hot-path repoint (BM‑97) then shipped in PR 11.
+
+**Where the plan changed, and why it matters.** This section originally said
+the hot-path fix was to repoint the campaign-worker's per-event *trigger*
+evaluation at the bitmap engine. That is **not** what shipped. PR 11 instead
+put campaign definitions and person attributes behind in-process caches
+(`campaigncache.go`, `attrcache.go`) and left trigger evaluation as an
+in-process `cond.Evaluate` over a single-event `EvalContext`.
+
+The distinction is worth being precise about, because it changes what the
+tier proves. The V2-1 ceiling was *MySQL reads on the hot path*, not
+condition-tree evaluation — the trigger eval was never the expensive part
+(one tree, one event, microseconds). Removing the two reads is what collapsed
+the backlog 9,134 → 83; routing trigger eval through the bitmap engine would
+have removed no MySQL work the caches hadn't already removed, and would have
+put a network hop where an in-process function call was. So the bitmap engine
+earns its place on the `/check` read surface (where it removes an unbounded
+per-person event scan, BM‑90/96) rather than on the fan-out path.
+
+Residual per-event CPU on the hot path — a trigger JSON decode and a
+`text/template` parse *per event* — was found and removed at close-out
+(0.2.6): `Campaign.Compile()` hoists both to once per cache refresh. That is
+the render-CPU candidate BM‑88 named, addressed without ever having become
+the binding constraint.
 
 #### 3.2.3 V2-3 — Batched idempotent enrollment (BM‑100..109)
 
@@ -274,7 +317,7 @@ retry/DLQ when a real sender exists.
 
 | ID | Requirement |
 |----|-------------|
-| `BM‑100` | `journey_enrollments` **MUST** carry a UNIQUE natural key `(workspace_id, campaign_id, triggered_by)` (migration 004) — one row per (campaign, inbound event). The enrollment insert **MUST** be `ON DUPLICATE KEY UPDATE` (no-op), so an at-least-once redelivery never creates a duplicate. Partly closes BM‑78 (audit idempotency; double-*send* still possible — see BM‑105). |
+| `BM‑100` | `journey_enrollments` **MUST** carry a UNIQUE natural key `(workspace_id, campaign_id, triggered_by)` (migration 004) — one row per (campaign, inbound event). The enrollment insert **MUST** be `ON DUPLICATE KEY UPDATE` (no-op), so an at-least-once redelivery never creates a duplicate. Partly closes BM‑78 (audit idempotency; double-*send* still possible — see BM‑105). **Deployment caveat:** migrations are mounted at `/docker-entrypoint-initdb.d`, which MySQL runs *only on an empty datadir*. On a volume created before this migration the `ALTER TABLE` never runs, and `ON DUPLICATE KEY UPDATE` then silently protects nothing — the guarantee is only true after `make down` (which takes volumes) or a manual `ALTER TABLE`. |
 | `BM‑101` | The campaign-worker **MUST** coalesce enrollment inserts into one multi-row commit per flush (`internal/campaign/batcher.go`), bounded by `BATCH_MAX` rows or `BATCH_WINDOW` time — amortizing the per-commit fsync that made the fan-out write side the backlog-prone laggard. |
 | `BM‑102` | A dispatch **MUST** ack its AMQP delivery only after its enrollment batch has COMMITTED (Submit blocks on the flush). A flush error **MUST** nack-requeue the event; the idempotent insert (BM‑100) makes re-dispatch safe. Preserves BM‑84 at-least-once. |
 | `BM‑103` | Batching **MUST** be toggleable (`CAMPAIGN_BATCH=on\|off`) for A/B measurement; the off path inserts directly but is still idempotent (BM‑100). |
@@ -431,32 +474,73 @@ Body: any JSON object ≤ 64 KiB
 
 ### Environment
 
+All services:
+
 ```
 MYSQL_DSN                       bm:bm@tcp(mysql:3306)/bm?parseTime=true
+MYSQL_MAX_OPEN_CONNS            50        (idle == open; see §6 V2-2x)
 OTEL_EXPORTER_OTLP_ENDPOINT     otel-collector:4317
 OTEL_METRICS_EXEMPLAR_FILTER    trace_based
-STUB_RECEIVER_URL               http://stub-receiver:8081     (track-api only)
-PORT                            8080 / 8081 per service
+PORT                            8080 track-api / 8081 stub-receiver /
+                                8082 campaign-worker / 8083 segment-worker
 ```
+
+`track-api`:
+
+```
+AMQP_URL                        amqp://guest:guest@rabbitmq:5672/
+SEGMENT_INDEX_URL               http://segment-worker:8083   (unset → V1 scan)
+```
+
+`campaign-worker`:
+
+```
+AMQP_URL                        amqp://guest:guest@rabbitmq:5672/
+STUB_RECEIVER_URL               http://stub-receiver:8081
+PREFETCH                        32        consumer concurrency (BM-81)
+CAMPAIGN_HOT_PATH               cache|mysql   A/B for the V2-2c caches
+CAMPAIGN_BATCH                  on|off        A/B for V2-3 batching (BM-103)
+BATCH_MAX                       64        rows per enrollment flush
+BATCH_WINDOW                    10ms      max wait for a flush to fill
+```
+
+`segment-worker`:
+
+```
+AMQP_URL                        amqp://guest:guest@rabbitmq:5672/
+SEGMENT_PREFETCH                32
+```
+
+Every knob above is plumbed through `docker-compose.yml` as
+`${VAR:-default}`, so an A/B run is `CAMPAIGN_BATCH=off make up` rather than a
+compose edit. `STUB_RECEIVER_URL` is deliberately **not** set on `track-api`:
+since V2-1b it is a producer only and never dispatches.
 
 ---
 
-## 5. Out of Scope (V1)
+## 5. Out of Scope
 
-Deferred to V2/V3 unless noted. Each line names the version that closes
-the gap.
+Each line names the version that closes the gap. Items marked ✅ shipped and
+are kept here only to show where the line moved.
 
+**Closed since V1:**
+
+- ✅ **Roaring bitmaps for segment evaluation** — shipped V2-2 (`internal/segmentidx`, `cmd/segment-worker`).
+- ✅ **RabbitMQ async fan-out** — shipped V2-1 (`campaigns.fanout`, `cmd/campaign-worker`).
+- ✅ **Enrollment idempotency** — shipped V2-3 Lean (UNIQUE natural key + `ON DUPLICATE KEY UPDATE`).
+
+**Still out of scope:**
+
+- **Two-phase dispatch / send-gate** (`idempotency_keys`, `sending` → `sent`) — deferred from V2-3 to V3; see BM‑105 and §8. The `events` PK plus the enrollment UNIQUE key give storage- and audit-layer idempotency; the double-*send* window remains open.
 - **Multi-step journeys with delays** — V3.
-- **Roaring bitmaps for segment evaluation** — V2.
-- **RabbitMQ async fan-out** — V2 (V1 uses an in-process channel; V1 doesn't yet have multi-stage fan-out demanding a broker).
-- **Idempotency keys + two-phase dispatch** — V2. PK on `events` provides storage-layer idempotency only.
 - **Anonymous-to-identified merge** — V3 stretch.
+- **`otelsql` for MySQL query spans** — still unwired. Originally billed as "a small follow-up commit after the kickoff scaffolding lands"; it never landed, and it's the reason BM‑42's trace has no DB spans. Cheap and worth doing, but it changes every query path, so it wants its own PR.
+- **Retry-with-backoff + a bounded requeue count** — V3-2 (BM‑85). Until then a delivery that fails for a non-transient reason requeues indefinitely; `messaging.consume.requeued{queue,redelivered}` exists so that's visible rather than silent.
 - **Custom objects** (non-person entities) — V4+.
-- **Liquid templating** — V4+; V1+V2 use Go `text/template`. Liquid is a yak.
-- **`otelsql` for MySQL query spans** — small follow-up commit after the kickoff scaffolding lands.
+- **Liquid templating** — V4+; V1+V2 use Go `text/template`. Liquid is a yak (lexer/parser, custom tags, sandboxing).
 - **Authentication, multi-tenancy enforcement at the API gateway, TLS** — V4+ / out of portfolio scope.
-- **Horizontal scaling beyond one replica per service** — V3 introduces per-workspace worker pools; multi-replica auto-scaling is V4.
-- **Liquid templating, send rate quotas, schema evolution tooling, Loki-side log retention policy** — V4+.
+- **Horizontal scaling beyond one replica per service** — V3 introduces per-workspace worker pools; multi-replica auto-scaling is V4. (Both workers are already multi-replica-*safe*: competing consumers on the campaign queues, per-replica ephemeral queues on `people.changes`.)
+- **Send rate quotas, schema evolution tooling, Loki-side log retention policy** — V4+.
 
 ---
 
@@ -468,9 +552,11 @@ bottleneck-migration narrative with hardware-pinned numbers.
 | Tier | Mechanism added | Observed ceiling on this hardware | New bottleneck |
 |---|---|---|---|
 | V1 | Track API + MySQL + in-process channel + scan segment eval + stub HTTP dispatch | Intake ~568/s; fan-out **~196/s** (~69% dropped) | Single Dispatcher consumer goroutine — 4 serial MySQL hops + 1 sync HTTP per event |
-| V2-1 | RabbitMQ durable fan-out + `campaign-worker` (manual ack, `PREFETCH` concurrency) | Fan-out **~2,800/s**, zero loss (~14× V1) | Per-event MySQL work (`ListByWorkspace` + `people.Get` + enrollment `INSERT`) over the 25-conn pool on the single shared MySQL |
-| V2-2 | Roaring bitmaps + remove per-event segment scan | *(TBD)* | *(TBD — expected: render CPU / bitmap memory)* |
-| V3 | Journey FSM + DLQs + per-workspace queue isolation | *(TBD)* | V4 sharding |
+| V2-1 | RabbitMQ durable fan-out + `campaign-worker` (manual ack, `PREFETCH` concurrency) | Fan-out **~2,800/s**, zero loss (~14× V1) | Per-event MySQL work (`ListByWorkspace` + `people.Get` + enrollment `INSERT`) over the then-default 25-conn pool on the single shared MySQL |
+| V2-2 | Roaring bitmaps (`segment-worker` serves `/check`) + campaign/attribute caches remove the per-event MySQL reads from the fan-out hot path | Worker stops being the constraint: backlog **9,134 → 83**, worker CPU 224% → 145%. Intake flat at **~2,700/s** under doubled concurrency | **Shared single MySQL write throughput** — one event `INSERT` + one enrollment `INSERT` per event, MySQL pinned ~306% while worker (145%) and track-api (130%) have headroom |
+| V2-2x | MySQL pool default 25 → 50 (PR 12) | Intake **2,173 → 2,836/s**, p99 **306 → 197 ms** going 25 → 64 conns | Still MySQL writes — the pool was throttling *access* to the bottleneck, not the bottleneck itself |
+| V2-3 | Batched idempotent enrollment (multi-row commit per flush + UNIQUE natural key) | Write side keeps pace: peak backlog **166** batched vs **156,961** unbatched; ~63.5 rows/flush; 0 duplicate enrollments across 700k+ rows | Still the shared MySQL, now on the event-`INSERT` (intake) side — the fan-out write is amortized. Next levers: read/write split, or shard (V3/V4) |
+| V3 | Journey FSM + DLQs + per-workspace queue isolation | *(not built)* | V4 sharding |
 
 ---
 
@@ -494,7 +580,11 @@ bottleneck-migration narrative with hardware-pinned numbers.
 
 ## 8. Open Questions
 
-*(none at V1; V2 + V3 will add tier-specific questions.)*
+| # | Question | State |
+|---|----------|-------|
+| Q12 | Where does the two-phase send-gate belong (BM‑105)? | **Deferred out of V2-3, open for V3.** On a stub sink with a write-bound MySQL it adds two writes per dispatch for no observable payoff — the measurement said the write side was already the constraint. It only earns its cost against a real sender that can double-charge, and its natural partner is V3-2's retry/DLQ semantics (a send-gate without bounded retry just moves the failure). Decide when a real ESP replaces `stub-receiver`. |
+| Q13 | How is a poison message bounded before V3-2? | **Open.** Requeue is currently unbounded (BM‑85 defers retry semantics). `messaging.consume.requeued{queue,redelivered}` makes a spin visible, but nothing stops it. Candidates: a `x-delivery-count` header maintained by the worker; RabbitMQ quorum queues with `delivery-limit` (also gets DLQ routing for free); or an app-side attempt counter in the message body. Quorum queues look cheapest and move the mechanism into the broker, which is where V2-1's design instinct already put backlog. |
+| Q14 | Does the eventual-consistency window on attributes need bounding? | **Open, low priority.** V2-2c trades per-event `person.Get` for an in-process cache fed by `people.changes`; an event arriving just after an attribute change can evaluate the pre-change value. Cache-miss falls back to MySQL so a *new* person is never missed — only a *recently changed* value is briefly stale. Unmeasured: how wide the window actually is under load. Worth a number before claiming it's negligible. |
 
 ---
 
@@ -502,16 +592,18 @@ bottleneck-migration narrative with hardware-pinned numbers.
 
 | Version | Date       | Author        | Notes |
 |---------|------------|---------------|-------|
-| 0.1     | 2026-05-20 | Steve Weiland | V1 draft. Two services, MySQL, in-process channel, scan-based segment eval (placeholder — V1 PR 2 wires it). Resolved Q1–Q9. |
-| 0.1.1   | 2026-05-21 | Steve Weiland | V1 PR 2: person store. `BM‑26..29` added — `POST/GET /people` and event-path person auto-create. JSON_MERGE_PATCH semantics (RFC 7396) for attribute upserts; null-value-deletes-key documented. §4 I/O surface updated. |
-| 0.1.2   | 2026-05-21 | Steve Weiland | V1 PR 3: segment store + scan-based evaluator. `BM‑30..38` added — six-op condition tree (and/or/not/attr_eq/attr_exists/event_seen), depth cap 8, structural JSON equality. `Condition` API will be reused by the V1 PR 4 campaign trigger. §4 I/O surface gains `/segments` + check endpoint. Q10–Q11 resolved (scan-based V1, V2 swaps to bitmaps). |
-| 0.1.3   | 2026-05-21 | Steve Weiland | V1 PR 4: campaign trigger + in-process fan-out. `BM‑70..79` added — `POST/GET /campaigns`, `Dispatcher` (buffered channel + single consumer goroutine, drop-on-full with Prometheus counter, async `campaign.process` span joined to the producer trace), trigger reuses `segment.Condition` verbatim with a single-event `EvalContext` (so `event_seen` matches the inbound event), Go `text/template` rendering with `missingkey=zero`, `journey_enrollments` audit insert per dispatch. The kickoff-PR direct `forwardToStub` smoke path is now routed through the Dispatcher's `dispatch` HTTP call. §4 I/O surface gains `/campaigns`. |
-| 0.1.4   | 2026-05-21 | Steve Weiland | Spelling sweep: British → American. Schema rename `journey_enrolments` → `journey_enrollments`, column `enrolment_id` → `enrollment_id`, indexes `idx_enrolments_*` → `idx_enrollments_*` (`enrolled_at` kept — past-tense spelling is identical in both dialects). Go identifiers `EnrolmentID`/`enrolID`/`insertEnrolment` retitled. Prose `behaviour`/`behavioural`/`enrol(s)` retitled across spec/README/comments. No behavior change; live MySQL needs a one-time `RENAME TABLE` (or `make down -v && make up` reset). |
-| 0.1.5   | 2026-05-21 | Steve Weiland | V1 PR 5 closes V1: `chaos/load-v1.sh` (bash+curl closed-loop driver, `make load-{prep,quick,soak}`); soak measured 568 events/s intake, ~196 events/s fan-out, ~69% drop at the in-process channel. Bottleneck named: single Dispatcher consumer doing four serial MySQL hops + one sync HTTP per event. §3.2 V2 — Throughput rewritten: V2-1 RabbitMQ async fan-out spelled out as `BM‑80..89` (per-workspace queues from day 1, durable + manual-ack, DLQ topology established, V2-1 writeup names the new ceiling); V2-2 + V2-3 stubbed for their PR time. README gains the V1 ceiling section with hardware banner. |
-| 0.1.6   | 2026-05-21 | Steve Weiland | V2 PR 6 (V2-1a infra): RabbitMQ 3.13 added to compose; `internal/amqpx/` lifted from Build 5 (Connect/Publish/Consume + W3C traceparent over AMQP headers + Outcome enum + consume duration/dropped metrics); `internal/campaign/topology.go` declares `campaigns.fanout` (direct) + `campaigns.fanout.dlx` (fanout) + `campaigns.fanout.dlq` (durable, bound to DLX) at track-api startup. Dispatch path unchanged — broker is wired but unused. |
+| 0.2.6   | 2026-07-28 | Steve Weiland | Close-out review of V1 + V2 (no new tier). **Unmet MUSTs closed:** BM‑82/86 — per-workspace queue depth was specified but never observable; RabbitMQ is now scraped at `/metrics/detailed` with `workspace_id` relabeled out of the queue name (excluding the global DLQ and the `segments.index.people` feed, which would otherwise appear as phantom workspaces). BM‑86 amended: the app-emitted `campaign_queue_depth` gauge it specified was the wrong design — the broker owns the depth. BM‑103 — `CAMPAIGN_BATCH`/`BATCH_MAX`/`BATCH_WINDOW` now plumbed through compose, so the batching A/B is reproducible without editing it. BM‑52 — `make load` alias added. BM‑42 — trace shape updated to the V2-1b reality (via the broker; MySQL spans still absent, `otelsql` still unwired). **Bug found + fixed:** `Publisher.Submit` folded the shutdown check into the same `select` as the buffer send, so with both cases ready Go's uniform-random choice enqueued ~half of post-`Stop()` events into a buffer nothing drains — counted as neither drop reason. Silent loss is the exact V1 bug V2 replaced; shutdown now gets deterministic precedence. Surfaced by writing the first `Publisher` test. **Hot path:** trigger JSON decode + `text/template` parse were running per event; `Campaign.Compile()` hoists both to once per cache refresh (the `CAMPAIGN_HOT_PATH=mysql` baseline still recompiles per event, deliberately). **Observability:** `messaging.consume.requeued{queue,redelivered}` — requeue is unbounded until V3-2, so a poison message spinning was previously invisible behind an empty DLQ. **Spec hygiene:** duplicate `BM‑30/31/32` (segment store vs stub receiver) renumbered to `BM‑43..45`; §3.1.4 → §3.1.4d; §5 out-of-scope reconciled with what shipped; §6 tier table filled for V2-2/V2-2x/V2-3 and the "render CPU / bitmap memory" guess replaced with the measured answer (shared-MySQL writes) in §1 and §6; §4 environment completed; §8 gains Q12–Q14 (send-gate placement, poison-message bounding, attribute staleness window); revision history reordered newest-first. |
 | 0.2.5   | 2026-05-31 | Steve Weiland | V2 PR 13 (V2-3 Lean): batched idempotent enrollment. Migration 004 adds UNIQUE `(workspace_id, campaign_id, triggered_by)` → `INSERT … ON DUPLICATE KEY UPDATE` makes redelivery a no-op (BM‑100, partly closes BM‑78). New `internal/campaign/batcher.go` coalesces enrollment inserts into one multi-row commit per flush (`BATCH_MAX`/`BATCH_WINDOW`); Submit blocks until commit then acks (BM‑101/102). `CAMPAIGN_BATCH` A/B toggle (BM‑103). Measured: backlog 156,961 → 166 with batching; 0 duplicate enrollments across 700k+ rows. Two-phase send-gate deferred (BM‑105). §3.2.3 filled. |
+| 0.2.4b  | 2026-05-29 | Steve Weiland | V2 PR 12 (perf): MySQL pool default 25 → 50 (`MYSQL_MAX_OPEN_CONNS`, idle == open), `--max-connections=300` on the server so 3 services × 50 fits. Measured at the V2-2 write ceiling: intake **2,173 → 2,836/s**, p99 **306 → 197 ms** going 25 → 64 conns — requests were queuing on the pool *before* reaching the bottleneck, so the pool was throttling access to MySQL rather than MySQL being slower than measured. 50 banks most of the gain. *Recorded retroactively in 0.2.6: PR 12 shipped without a spec bump, and these numbers lived only in a comment in `internal/eventstore/eventstore.go`.* |
 | 0.2.4   | 2026-05-29 | Steve Weiland | V2 PR 11 (V2-2c): campaign-worker hot-path repoint. New `internal/campaign/attrcache.go` (attributes from `people.changes` + boot backfill + MySQL fallback-on-miss) and `campaigncache.go` (per-workspace TTL list); `Processor` reads both from cache instead of per-event `ListByWorkspace` + `person.Get`. Per-replica ephemeral queue on the people.changes fanout keeps the cache complete at N replicas. `CAMPAIGN_HOT_PATH=cache\|mysql` escape hatch for A/B. Closes BM‑97 — worker backlog 9,134→83, ceiling migrated to shared-MySQL writes. Trade: per-event attribute reads become eventually consistent (fallback-on-miss bounds it). |
 | 0.2.3   | 2026-05-29 | Steve Weiland | V2 PR 10 (V2-2b): `cmd/segment-worker/` — boot backfill (`person.All` + `eventstore.DistinctPersonEvents`) + incremental maintenance from `campaigns.fanout` (own `segments.index.<ws>` queues) and the new `people.changes` feed; `POST /internal/check` membership API. track-api repointed `/segments/{id}/check` at it (`SEGMENT_INDEX_URL`) with scan fallback + `backend` log, and publishes merged attributes on `POST /people`. BM‑92..96. Verified via `make seed-segments` (all `backend=bitmap`). §3.2.2 filled. |
 | 0.2.2   | 2026-05-29 | Steve Weiland | V2 PR 9 (V2-2a): `internal/segmentidx` roaring-bitmap engine — base bitmaps (eventSeen / attrEq / attrExists), incremental `Observe*` (move-on-update, clear-on-delete), `Member` over the `segment.Condition` tree with bitmap leaves, unknown-person-non-member. 9 tests. BM‑90/91. Adds `RoaringBitmap/roaring/v2`. |
 | 0.2.1   | 2026-05-29 | Steve Weiland | V2 PR 8 (V2-1 ceiling): re-measured fan-out on the same hardware with a new Go driver (`cmd/loadgen/`) + live fan-out sampling (`chaos/watch-fanout.sh`, `chaos/ceiling-run.sh`). Closes BM‑87/88 — new ceiling **~2,800/s fan-out, zero loss (~14× V1)**, bottleneck named as per-event MySQL over the 25-conn pool (BM‑88 "MySQL connection-pool contention" candidate confirmed). Two latent Go HTTP connection-leak bugs found + fixed en route (default transport pool; undrained response body → ephemeral-port exhaustion under high `PREFETCH`); `PREFETCH` made host-tunable in compose. §3.2.1 gains the V2-1 ceiling + Lessons block; §6 tier table filled for V1 + V2-1. |
 | 0.2.0   | 2026-05-21 | Steve Weiland | V2 PR 7 (V2-1b switch): in-process `Dispatcher` retired; `Publisher` publishes per accepted event to `campaigns.fanout` with routing_key=workspace_id (goroutine + bounded retry — never blocks the HTTP reply, BM-89); new `cmd/campaign-worker/` consumes per-workspace queues (`PREFETCH`=32, manual ack) and runs `campaign.Processor.Process`. Outcomes: Ack on success/no-match; NackRequeue on transient infra failure; NackDrop on terminal (person row missing) — routes to DLQ via queue-level `x-dead-letter-exchange`. `campaign_queue_dropped_total` retired (BM-86); replaced with `campaign_publish_dropped_total{workspace_id,reason}` for buffer overflow / retry exhaustion / shutdown drops. Closes BM-80..86 + BM-89. Re-measurement (BM-87/88) lands in V2 PR 8. |
+| 0.1.6   | 2026-05-21 | Steve Weiland | V2 PR 6 (V2-1a infra): RabbitMQ 3.13 added to compose; `internal/amqpx/` lifted from Build 5 (Connect/Publish/Consume + W3C traceparent over AMQP headers + Outcome enum + consume duration/dropped metrics); `internal/campaign/topology.go` declares `campaigns.fanout` (direct) + `campaigns.fanout.dlx` (fanout) + `campaigns.fanout.dlq` (durable, bound to DLX) at track-api startup. Dispatch path unchanged — broker is wired but unused. |
+| 0.1.5   | 2026-05-21 | Steve Weiland | V1 PR 5 closes V1: `chaos/load-v1.sh` (bash+curl closed-loop driver, `make load-{prep,quick,soak}`); soak measured 568 events/s intake, ~196 events/s fan-out, ~69% drop at the in-process channel. Bottleneck named: single Dispatcher consumer doing four serial MySQL hops + one sync HTTP per event. §3.2 V2 — Throughput rewritten: V2-1 RabbitMQ async fan-out spelled out as `BM‑80..89` (per-workspace queues from day 1, durable + manual-ack, DLQ topology established, V2-1 writeup names the new ceiling); V2-2 + V2-3 stubbed for their PR time. README gains the V1 ceiling section with hardware banner. |
+| 0.1.4   | 2026-05-21 | Steve Weiland | Spelling sweep: British → American. Schema rename `journey_enrolments` → `journey_enrollments`, column `enrolment_id` → `enrollment_id`, indexes `idx_enrolments_*` → `idx_enrollments_*` (`enrolled_at` kept — past-tense spelling is identical in both dialects). Go identifiers `EnrolmentID`/`enrolID`/`insertEnrolment` retitled. Prose `behaviour`/`behavioural`/`enrol(s)` retitled across spec/README/comments. No behavior change; live MySQL needs a one-time `RENAME TABLE` (or `make down -v && make up` reset). |
+| 0.1.3   | 2026-05-21 | Steve Weiland | V1 PR 4: campaign trigger + in-process fan-out. `BM‑70..79` added — `POST/GET /campaigns`, `Dispatcher` (buffered channel + single consumer goroutine, drop-on-full with Prometheus counter, async `campaign.process` span joined to the producer trace), trigger reuses `segment.Condition` verbatim with a single-event `EvalContext` (so `event_seen` matches the inbound event), Go `text/template` rendering with `missingkey=zero`, `journey_enrollments` audit insert per dispatch. The kickoff-PR direct `forwardToStub` smoke path is now routed through the Dispatcher's `dispatch` HTTP call. §4 I/O surface gains `/campaigns`. |
+| 0.1.2   | 2026-05-21 | Steve Weiland | V1 PR 3: segment store + scan-based evaluator. `BM‑30..38` added — six-op condition tree (and/or/not/attr_eq/attr_exists/event_seen), depth cap 8, structural JSON equality. `Condition` API will be reused by the V1 PR 4 campaign trigger. §4 I/O surface gains `/segments` + check endpoint. Q10–Q11 resolved (scan-based V1, V2 swaps to bitmaps). |
+| 0.1.1   | 2026-05-21 | Steve Weiland | V1 PR 2: person store. `BM‑26..29` added — `POST/GET /people` and event-path person auto-create. JSON_MERGE_PATCH semantics (RFC 7396) for attribute upserts; null-value-deletes-key documented. §4 I/O surface updated. |
+| 0.1     | 2026-05-20 | Steve Weiland | V1 draft. Two services, MySQL, in-process channel, scan-based segment eval (placeholder — V1 PR 2 wires it). Resolved Q1–Q9. |

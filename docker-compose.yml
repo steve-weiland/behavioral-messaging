@@ -136,7 +136,9 @@ services:
       AMQP_URL: amqp://guest:guest@rabbitmq:5672/
       OTEL_EXPORTER_OTLP_ENDPOINT: otel-collector:4317
       OTEL_METRICS_EXEMPLAR_FILTER: trace_based
-      STUB_RECEIVER_URL: http://stub-receiver:8081
+      # No STUB_RECEIVER_URL here: since V2-1b track-api is a producer only —
+      # it publishes to campaigns.fanout and never dispatches. The stub URL
+      # belongs to campaign-worker, which does the sending.
       SEGMENT_INDEX_URL: http://segment-worker:8083
       MYSQL_MAX_OPEN_CONNS: "${MYSQL_MAX_OPEN_CONNS:-50}"
       PORT: "8080"
@@ -185,6 +187,11 @@ services:
       PREFETCH: "${PREFETCH:-32}"
       CAMPAIGN_HOT_PATH: "${CAMPAIGN_HOT_PATH:-cache}"
       MYSQL_MAX_OPEN_CONNS: "${MYSQL_MAX_OPEN_CONNS:-50}"
+      # BM-103: the batching A/B has to be switchable from the host or the
+      # measurement isn't reproducible — `CAMPAIGN_BATCH=off make up`.
+      CAMPAIGN_BATCH: "${CAMPAIGN_BATCH:-on}"
+      BATCH_MAX: "${BATCH_MAX:-64}"
+      BATCH_WINDOW: "${BATCH_WINDOW:-10ms}"
       PORT: "8082"
     ports:
       - "8092:8082"

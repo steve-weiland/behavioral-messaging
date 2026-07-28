@@ -3,6 +3,7 @@ package campaign
 import (
 	"context"
 	"database/sql"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -57,6 +58,19 @@ func (c *CampaignCache) List(ctx context.Context, workspaceID string) ([]Campaig
 			return stale.campaigns, nil // serve last good
 		}
 		return nil, err
+	}
+
+	// Compile the trigger + template once per refresh rather than per event.
+	// A compile failure is logged and left uncompiled: the per-event path
+	// decodes inline and logs there, so one corrupt definition degrades to
+	// V1 behavior instead of taking the workspace's fan-out down.
+	for i := range cs {
+		if err := cs[i].Compile(); err != nil {
+			slog.WarnContext(ctx, "campaign definition failed to compile — falling back to per-event decode",
+				slog.String("workspace_id", workspaceID),
+				slog.String("campaign_id", cs[i].CampaignID),
+				slog.Any("error", err))
+		}
 	}
 
 	c.mu.Lock()

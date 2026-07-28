@@ -1,14 +1,16 @@
-// Package campaign — V1 campaign trigger + single-step render/dispatch.
+// Package campaign — campaign trigger + single-step render/dispatch.
 //
 // A campaign is:
 //   - a trigger (segment.Condition) evaluated against the inbound event
 //     and the person it belongs to, and
 //   - a Go text/template rendered with that same context.
 //
-// V1 fan-out is in-process: cmd/track-api/main.go creates one Dispatcher
-// at startup, calls Submit(event) from the /events handler, and the
-// Dispatcher's single consumer goroutine evaluates+renders+dispatches.
-// V2 replaces the channel with RabbitMQ.
+// Fan-out is asynchronous over RabbitMQ (V2-1b). track-api's /events
+// handler calls Publisher.Submit, which publishes to `campaigns.fanout`
+// keyed by workspace_id; cmd/campaign-worker consumes the per-workspace
+// queue and runs Processor.Process per event. V1's in-process Dispatcher
+// (one buffered channel, one consumer goroutine) is retired — it is the
+// ceiling the V2 tier exists to remove; see spec §3.2.
 package campaign
 
 import (
@@ -17,7 +19,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"text/template"
 	"time"
+
+	"github.com/steveweiland/behavioral-messaging/internal/segment"
 )
 
 // Campaign is the persisted shape of one campaign definition.
@@ -29,6 +34,33 @@ type Campaign struct {
 	Template    string          `json:"template"`
 	CreatedAt   time.Time       `json:"created_at"`
 	UpdatedAt   time.Time       `json:"updated_at"`
+
+	// Compiled artifacts, populated by Compile(). Both are pure functions
+	// of Trigger/Template, and campaigns are create-only, so compiling once
+	// per cache refresh removes a JSON decode + a text/template parse from
+	// every event on the fan-out hot path. Nil on the direct-MySQL path,
+	// which recompiles per event by design — that's the A/B baseline
+	// (CAMPAIGN_HOT_PATH=mysql), so it must stay honestly slow.
+	cond *segment.Condition
+	tpl  *template.Template
+}
+
+// Compile decodes the trigger and parses the template, caching both on the
+// Campaign. Called by CampaignCache after a refresh. A failure leaves the
+// artifacts nil, so the per-event path falls back to decoding inline and
+// logs there — a corrupt stored definition degrades, it doesn't crash the
+// worker.
+func (c *Campaign) Compile() error {
+	cond, err := segment.DecodeCondition(c.Trigger)
+	if err != nil {
+		return fmt.Errorf("decode trigger: %w", err)
+	}
+	tpl, err := template.New("campaign").Option("missingkey=zero").Parse(c.Template)
+	if err != nil {
+		return fmt.Errorf("parse template: %w", err)
+	}
+	c.cond, c.tpl = &cond, tpl
+	return nil
 }
 
 // ErrNotFound is returned by Get when no row exists.

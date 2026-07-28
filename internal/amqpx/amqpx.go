@@ -16,6 +16,7 @@ package amqpx
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -54,9 +55,10 @@ func (o Outcome) String() string {
 type Handler func(ctx context.Context, d amqp.Delivery) Outcome
 
 var (
-	metricsOnce      sync.Once
-	consumeDuration  metric.Float64Histogram
-	consumeDroppedCt metric.Int64Counter
+	metricsOnce       sync.Once
+	consumeDuration   metric.Float64Histogram
+	consumeDroppedCt  metric.Int64Counter
+	consumeRequeuedCt metric.Int64Counter
 )
 
 func initMetrics() {
@@ -77,6 +79,19 @@ func initMetrics() {
 		)
 		if err != nil {
 			panic(fmt.Errorf("amqpx counter: %w", err))
+		}
+		// Requeues are unbounded by design until V3-2 adds retry-with-backoff
+		// (BM-85): a delivery that keeps failing for a non-transient reason
+		// requeues forever at full speed. This counter (and the redelivered
+		// attribute) is what makes that visible — a rising requeue rate with
+		// flat throughput is the signature. Alert on it rather than assuming
+		// an empty DLQ means healthy.
+		consumeRequeuedCt, err = m.Int64Counter(
+			"messaging.consume.requeued",
+			metric.WithDescription("Deliveries nacked with requeue=true. Sustained non-zero = a poison message is spinning (no retry bound until V3-2)."),
+		)
+		if err != nil {
+			panic(fmt.Errorf("amqpx requeue counter: %w", err))
 		}
 	})
 }
@@ -196,6 +211,8 @@ func Consume(
 					),
 				)
 
+				span.SetAttributes(attribute.Bool("messaging.rabbitmq.redelivered", d.Redelivered))
+
 				outcome := handler(ctx, d)
 				switch outcome {
 				case OutcomeAck:
@@ -213,8 +230,21 @@ func Consume(
 					attribute.String("outcome", outcome.String()),
 				)
 				consumeDuration.Record(ctx, dur, attrs)
-				if outcome == OutcomeNackDrop {
+				switch outcome {
+				case OutcomeNackDrop:
 					consumeDroppedCt.Add(ctx, 1, metric.WithAttributes(queueAttr))
+				case OutcomeNackRequeue:
+					// Split first-attempt failures from repeats: a climbing
+					// redelivered=true rate is a message that will never
+					// succeed, which is otherwise invisible (the DLQ stays
+					// empty because requeue never dead-letters).
+					consumeRequeuedCt.Add(ctx, 1, metric.WithAttributes(queueAttr,
+						attribute.Bool("redelivered", d.Redelivered)))
+					if d.Redelivered {
+						slog.WarnContext(ctx, "delivery requeued after a previous attempt",
+							slog.String("queue", queue),
+							slog.String("message_id", d.MessageId))
+					}
 				}
 				span.End()
 			}(d)

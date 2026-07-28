@@ -15,8 +15,23 @@ changed, what now breaks" writeup with hardware-pinned measurements.
 | | |
 |--|--|
 | **Spec** | [`spec.md`](./spec.md) — RFC-2119 V1 + V2 + V3 requirements |
-| **Status** | `v0.2.0-throughput` + V2-2 in progress. V1 foundation + V2-1 RabbitMQ async fan-out live (ceiling **~2,800 events/s, zero loss (~14× V1)** — see [§ V2-1 ceiling](#v2-1-ceiling-measured-2026-05-29)). `v0.2.5` tagged (V2-2 complete). V2-2: roaring-bitmap `segment-worker` serves `/check` (no MySQL scan) + campaign-worker hot path reads from in-process caches — fan-out worker stopped being the bottleneck (backlog 9,134 → 83), which **migrated to shared MySQL write throughput** ([§ V2-2 ceiling](#v2-2-hot-path-ceiling-measured-2026-05-29)). V2-3: batched idempotent enrollment — keeps the write side from backing up (backlog 156,961 → 166) and makes at-least-once redelivery a no-op. |
-| **Stack** | Go 1.25 · MySQL 8.0 · OpenTelemetry SDK + Collector 0.151 · Tempo 2.10 · Prometheus 3.11 · Loki 3.7 · Grafana Alloy v1.16 · Grafana 13.0 · `docker compose` |
+| **Status** | **V1 + V2 complete** (spec 0.2.6). V3 is designed, not built. |
+| **Stack** | Go 1.25 · MySQL 8.0 · RabbitMQ 3.13 · OpenTelemetry SDK + Collector 0.151 · Tempo 2.10 · Prometheus 3.11 · Loki 3.7 · Grafana Alloy v1.16 · Grafana 13.0 · `docker compose` |
+
+**The tier story in four numbers.** Fan-out throughput **196/s → ~2,800/s**
+(~14×) with **silent loss eliminated** — V1 dropped ~69% of accepted events on
+the floor of an in-process channel; V2's durable queue turns that gap into a
+drainable backlog instead. Then the bottleneck moved twice: off the worker's
+per-event MySQL reads (backlog **9,134 → 83**), and off the enrollment write
+(backlog **156,961 → 166** with batching), landing on the one thing left —
+a single shared MySQL's write throughput.
+
+| Tier | Mechanism | Result | Where the bottleneck went |
+|---|---|---|---|
+| **V1** | In-process channel + scan segment eval + sync dispatch | intake 568/s, fan-out 196/s, **69% dropped** | the single Dispatcher goroutine |
+| **V2-1** | RabbitMQ durable fan-out + worker pool | fan-out **~2,800/s**, zero loss | per-event MySQL reads on the worker |
+| **V2-2** | Bitmap `/check` + campaign/attribute caches | backlog **9,134 → 83** | shared MySQL **writes** |
+| **V2-3** | Batched idempotent enrollment | backlog **156,961 → 166** | shared MySQL writes (intake side) |
 
 ---
 
@@ -25,7 +40,7 @@ changed, what now breaks" writeup with hardware-pinned measurements.
 | Tier | Mechanism shift | Bottleneck removed → new bottleneck |
 |---|---|---|
 | **V1 Foundation** | Workspace-scoped from day 1. Single-process per service, single MySQL, in-process channel queue, scan-based segment eval, sync stub dispatch. | (baseline — sets the first ceiling) |
-| **V2 Throughput** | Roaring bitmaps for segments + RabbitMQ async fan-out + idempotency keys + two-phase dispatch. | Render CPU / bitmap memory per workspace. |
+| **V2 Throughput** | Roaring bitmaps for segments + RabbitMQ async fan-out + batched idempotent enrollment. | **Measured: shared single-MySQL write throughput.** Not render CPU or bitmap memory — those were the guesses going in, and neither is reached while one MySQL gates every event's two inserts. |
 | **V3 Durability** | Per-person journey state machine with delays (persisted FSM, SKIP-LOCKED scheduler) + DLQs + retry + per-workspace queue isolation. | Cross-workspace coordination overhead (V4 sharding territory). |
 
 Multi-tenancy is **not** a tier — it's a cross-cutting V1 property
@@ -34,15 +49,31 @@ Multi-tenancy is **not** a tier — it's a cross-cutting V1 property
 ## Run it
 
 ```bash
-make up          # docker compose up -d --build (9 services in V1)
-make seed        # POST 10 events at 1 req/s
+make up            # docker compose up -d --build (12 services)
+make showcase      # every surface end-to-end: people → segment → campaign → events
+make seed          # POST 10 events at 1 req/s
 make seed-campaign # define welcome_pro + 2 people + fire signed_up — end-to-end smoke
-make load-quick  # 10s burst @ concurrency=5 — sanity-check the driver
-make load-soak   # 60s steady @ concurrency=20 — the V1 ceiling-search run
-make test        # go test ./...
-make mysql       # interactive mysql shell
-make down        # tear it all down (compose down --volumes --remove-orphans)
+make load          # the ceiling-search run (= load-soak: 60s @ concurrency=20)
+make load-quick    # 10s burst @ concurrency=5 — sanity-check the driver
+make test          # go test ./...
+make fmt vet       # gofmt + go vet
+make mysql         # interactive mysql shell
+make down          # tear it all down (compose down --volumes --remove-orphans)
 ```
+
+Every tuning knob is a host env var, so the A/B runs behind the measurements
+below are reproducible without editing compose:
+
+```bash
+PREFETCH=128 make up              # worker consumer concurrency
+CAMPAIGN_HOT_PATH=mysql make up   # V2-2 A/B: per-event MySQL reads vs caches
+CAMPAIGN_BATCH=off make up        # V2-3 A/B: one commit per enrollment
+MYSQL_MAX_OPEN_CONNS=25 make up   # the pre-PR-12 pool size
+```
+
+> `make down` takes the volumes with it. That's deliberate — migration 004's
+> `ALTER TABLE` only runs on an empty datadir, so a DB created before it would
+> silently lack the UNIQUE key that makes enrollment idempotent.
 
 ## V1 ceiling on this hardware
 
@@ -58,7 +89,7 @@ make down        # tear it all down (compose down --volumes --remove-orphans)
 | **RAM** | 36 GB |
 | **OS**  | macOS 15.7.3 (build 24G419), aarch64 |
 | **Container runtime** | Docker Engine 28.0.4, linux/arm64 |
-| **Topology** | All 9 services on one host. `track-api` is one replica, default `GOMAXPROCS`, no resource limits. |
+| **Topology** | All services on one host (9 at the time of the V1 run; 12 from V2-2 on). `track-api` is one replica, default `GOMAXPROCS`, no resource limits. |
 
 ### Soak configuration
 
@@ -118,7 +149,7 @@ bottleneck V2 was always going to remove.
 |---|---|---|
 | **V2-1** | RabbitMQ async fan-out + parallel render workers + per-workspace queue admission | Single consumer goroutine (this section). Replaces the 1024-deep in-process channel with durable, persisted queues; replaces the lone consumer with N workers. |
 | **V2-2** | Roaring bitmaps with incremental segment maintenance (`RoaringBitmap/roaring` upstream) | Per-event `ListByWorkspace` scan + the scan-based segment evaluator (BM‑33, BM‑36). |
-| **V2-3** | Idempotency keys + two-phase dispatch (`sending` → ack → `sent`) | Audit-failure-doesn't-reverse-dispatch gap (BM‑78). Retries become safe. |
+| **V2-3** | Batched idempotent enrollment — UNIQUE natural key + multi-row commit per flush | The per-commit fsync on the enrollment write, which made the fan-out write side the laggard. Redelivery stops double-enrolling (BM‑100). Shipped **Lean**: the two-phase send-gate (`sending` → ack → `sent`, BM‑105) is deferred to V3 — on a stub sink with a write-bound MySQL it adds writes for no payoff, and it wants V3's retry/DLQ semantics as a partner. |
 
 ### V2-1 ceiling (measured 2026-05-29)
 
@@ -180,6 +211,38 @@ close) dropped worker CPU 1,320%→240% and raised fan-out +70%
 (1,675→2,880/s) with zero errors. This is the V2-1 "what broke and how I
 fixed it" story.
 
+#### What broke: the producer's shutdown race
+
+Found at close-out, writing the first unit test for `Publisher`. `Submit` had
+three `select` cases — shutdown (`<-p.done`), enqueue (`p.ch <- job`), and
+`default` for a full buffer:
+
+```go
+select {
+case <-p.done:                     // ready once Stop() closes done
+    drop("shutdown")
+case p.ch <- publishJob{...}:      // also ready — the buffer has room
+    p.bufferDepth.Add(reqCtx, 1)
+default:
+    drop("buffer_full")
+}
+```
+
+After `Stop()`, the first two cases are **both** ready, and Go picks uniformly
+at random among ready cases. So roughly half of any event submitted during
+shutdown was enqueued into a buffer nothing would ever drain — and counted as
+neither drop reason. A silently dropped event, in the mechanism built
+specifically to eliminate V1's silent drops.
+
+The blast radius is small in practice: track-api drains HTTP before stopping
+the publisher, so few submits arrive after `Stop`. But it's silent, and the fix
+is to give shutdown its own `select` first so it has deterministic precedence.
+
+The part worth keeping: **three PRs of load measurement could never have found
+this.** Every ceiling run publishes into a running producer, so the shutdown
+path was never on the measured path. "We measured it at scale" and "we tested
+its edges" are different claims, and this build had only the first.
+
 ### V2-2 hot-path ceiling (measured 2026-05-29)
 
 V2-2 moves the campaign-worker's per-event work off MySQL: campaign
@@ -215,6 +278,37 @@ miss falls back to one `person.Get`, so a brand-new person is never
 silently missed; only a very-recently-changed value is briefly stale. The
 cold `/check` path is unchanged (still `backend=bitmap`).
 
+### V2-3 write-side ceiling (measured 2026-05-31)
+
+V2-2 left every event costing two MySQL inserts — one for the event (intake)
+and one for the enrollment (fan-out) — with the enrollment paying a commit,
+and therefore an fsync, each. V2-3 coalesces enrollments into one multi-row
+commit per flush (`BATCH_MAX=64` rows or `BATCH_WINDOW=10ms`, whichever comes
+first) and makes the insert idempotent so at-least-once redelivery re-inserts
+as a no-op. `Submit` blocks until its batch commits, so the AMQP ack still
+happens only after the audit row is durable.
+
+A/B on the same binary via `CAMPAIGN_BATCH`, fresh DB, pool 50, prefetch 128,
+c=200:
+
+| Batching | Peak queue backlog | Rows per flush |
+|---|---|---|
+| `off` (one commit per enrollment) | **156,961** | 1 |
+| `on` | **166** | ~63.5 (cap 64) |
+
+**The write side stops being the laggard.** Zero duplicate enrollments across
+700k+ rows. Absolute intake here (~5,750/s) is higher than PR 11's ~2,700/s
+because this ran against a fresh database — small tables and indexes insert
+faster — so the valid comparison is batching on-vs-off, not the absolute
+number. The bottleneck stays the shared MySQL, now on the intake insert.
+
+Before this, PR 12 raised the pool default 25 → 50 after finding requests
+queuing on the pool *in front of* MySQL: 25 → 64 connections moved intake
+**2,173 → 2,836/s** and p99 **306 → 197 ms**. The pool was throttling access
+to the bottleneck, not the bottleneck itself.
+
+## Surfaces
+
 | URL | What |
 |---|---|
 | http://localhost:8090/healthz | `track-api` (V1) — `{"status":"ok"}` |
@@ -230,9 +324,47 @@ cold `/check` path is unchanged (still `backend=bitmap`).
 | http://localhost:8091/healthz | `stub-receiver` (V1) — receives the rendered template per dispatched campaign |
 | http://localhost:3030/explore | Grafana — Tempo / Prometheus / Loki datasources provisioned. Try `{resource.service.name="track-api"}` in Tempo Search. |
 | http://localhost:3030/d/obs-red | RED dashboard (carried from Build 5). V1 panels populate once traffic flows. |
-| http://localhost:3030/d/obs-use | USE dashboard (Build 5 carryover). MySQL row needs queries rewritten in a follow-up commit; host + RabbitMQ rows from Build 5 will show partial data only (no RabbitMQ in V1). |
+| http://localhost:3030/d/obs-use | USE dashboard (Build 5 carryover), MySQL row rewritten for this build. |
 | http://localhost:9090/alerts | Prometheus alert rules — `TrackBurnRatePage` / `TrackBurnRateTicket`. |
+| http://localhost:9090/targets | Scrape health — `otel-collector` (app metrics) + `rabbitmq` (per-queue). |
 | `mysql -h 127.0.0.1 -P 3307 -ubm -pbm bm` | MySQL directly |
+
+## Watching the queue
+
+Prometheus scrapes the app metrics via the OTel collector, and RabbitMQ
+directly for per-queue state. The queues are named
+`campaigns.fanout.<workspace_id>`, so `workspace_id` is relabeled out of the
+queue name — which is what makes per-workspace admission (BM‑82) actually
+observable rather than merely implemented.
+
+```promql
+# backlog per workspace — the number every tier measurement in this README turns on
+rabbitmq_detailed_queue_messages_ready{workspace_id="ws_alpha"}
+
+# publish vs drain rate: if the first outruns the second, the backlog is growing
+rate(rabbitmq_detailed_queue_messages_published_total{workspace_id="ws_alpha"}[1m])
+rate(rabbitmq_detailed_queue_messages_delivered_total{workspace_id="ws_alpha"}[1m])
+
+# fan-out actually completing (app-side, per campaign)
+sum by (campaign_id) (rate(campaign_dispatched_total[1m]))
+
+# producer health: these should be flat zero. buffer_full or shutdown means loss.
+sum by (reason) (campaign_publish_dropped_total)
+campaign_publish_buffer_depth
+
+# poison-message watch: requeue is unbounded until V3-2 (Q13). A sustained
+# redelivered=true rate with flat dispatch throughput is a message spinning —
+# the DLQ stays empty in that case, so it can't be your only signal.
+sum by (redelivered) (rate(messaging_consume_requeued_total[1m]))
+rate(messaging_consume_dropped_total[1m])          # terminal → DLQ
+
+# enrollment batching effectiveness (V2-3): should sit near BATCH_MAX under load
+histogram_quantile(0.5, sum by (le) (rate(campaign_enroll_batch_rows_bucket[1m])))
+```
+
+`chaos/watch-fanout.sh` samples the same backlog live from RabbitMQ's
+management API — it predates the scrape job and is still the quicker read
+during a ceiling run.
 
 ## Host port matrix
 
@@ -256,17 +388,16 @@ cold `/check` path is unchanged (still `backend=bitmap`).
 behavioral-messaging/
 ├── spec.md, README.md, Makefile, docker-compose.yml, Dockerfile
 ├── go.mod / go.sum
-├── cmd/
-│   ├── track-api/                  V1 → V2 HTTP intake (now a producer-only — publishes to RabbitMQ)
+├── cmd/                            (5 binaries, all built; V3's journey-scheduler not yet written)
+│   ├── track-api/                  HTTP intake. Producer-only since V2-1b — publishes to RabbitMQ, never dispatches
 │   ├── campaign-worker/            V2 PR 7 — consumes per-workspace queues, runs the per-event Processor
-│   ├── stub-receiver/              V1 delivery sink
-│   ├── campaign-worker/            V1.x — campaign trigger + render (added next PR)
 │   ├── segment-worker/             V2-2 — bitmap index: boot backfill + stream maintenance + /internal/check
-│   ├── journey-scheduler/          V3 — SKIP-LOCKED scheduler
-│   └── loadgen/                    V1.x — Go load driver for scale ceiling runs
+│   ├── stub-receiver/              V1 delivery sink
+│   └── loadgen/                    Go load driver for the ceiling runs (replaced the bash driver in PR 8)
 ├── internal/
 │   ├── event/                      shared Event struct
-│   ├── eventstore/                 MySQL persistence (sql.Open in V1, otelsql follow-up)
+│   ├── eventstore/                 MySQL persistence + pool sizing (plain database/sql — otelsql still unwired, so
+│   │                               traces carry no DB spans; see spec §5)
 │   ├── otelinit/                   Build 5 carryover — TracerProvider + MeterProvider
 │   ├── logsx/                      Build 5 carryover — slog JSON + trace_id/span_id
 │   ├── amqpx/                      V2 PR 6 — thin amqp091 wrapper (Connect/Publish/Consume + traceparent propagation)
@@ -274,14 +405,16 @@ behavioral-messaging/
 │   ├── segment/                    V1.x — condition tree parser + scan evaluator
 │   ├── segmentidx/                 V2-2 — roaring bitmap engine (Observe* maintenance + Member)
 │   ├── peoplefeed/                 V2-2 — people.changes attribute-stream exchange + publisher
-│   ├── campaign/                   V1 PR 4 → V2 PR 7 — trigger + template + processor.go (per-event fan-out
-│   │                               body, returns amqpx.Outcome) + publisher.go (RabbitMQ producer with
-│   │                               goroutine + bounded retry) + topology.go (exchange/DLX/DLQ + per-workspace queue helper)
-│   │                               + attrcache.go / campaigncache.go (V2-2c hot-path caches) + batcher.go (V2-3 batched
-│   │                               idempotent enrollment inserts)
-│   └── journey/                    V3 — FSM with delays
+│   └── campaign/                   trigger + template + fan-out. processor.go (per-event body, returns
+│                                   amqpx.Outcome) · publisher.go (RabbitMQ producer, goroutine + bounded
+│                                   retry) · topology.go (exchange/DLX/DLQ + per-workspace queue helper) ·
+│                                   attrcache.go / campaigncache.go (V2-2c hot-path caches, and where the
+│                                   trigger/template compile is memoized) · batcher.go (V2-3 batched
+│                                   idempotent enrollment inserts)
 ├── deploy/                         Build 5 carryover — collector/tempo/prom/loki/alloy/grafana
-│   └── grafana/provisioning/dashboards/ — red.json + use.json (panels TBD-rewritten for MySQL)
+│   ├── prometheus.yml              scrapes the collector + RabbitMQ per-queue (workspace_id relabeled out
+│   │                               of the queue name — BM-82)
+│   └── grafana/provisioning/dashboards/ — red.json + use.json
 ├── migrations/                     001_v1.sql (workspaces, people, events, journey_enrollments, idempotency_keys) · 002_segments.sql · 003_campaigns.sql · 004_idempotency.sql (unique enrollment key)
 └── chaos/                          load-v1.sh (bash V1 driver) · watch-fanout.sh (live backlog+CPU sampler) ·
                                     ceiling-run.sh (V2 measured-run orchestrator; pairs with cmd/loadgen/)
@@ -318,11 +451,12 @@ or log shipping. Day-1 dashboards.
 | `v0.1.x` | V1 PRs 2-4 | Person store · segment evaluation (scan) · campaign trigger + in-process Dispatcher |
 | `v0.1.5-ceiling` | V1 PR 5 (tagged) | Load driver + V1 ceiling writeup (see [§ V1 ceiling](#v1-ceiling-on-this-hardware)). Bottleneck named: single Dispatcher consumer, 2.9× producer-consumer gap, ~69% drop rate at the soak rate. |
 | `v0.1.6-amqp` | V2 PR 6 | RabbitMQ infra + `internal/amqpx/` + `campaigns.fanout` topology declared at track-api startup. Dispatch path unchanged. |
-| `v0.1.7-fanout` | V2 PR 7 (this commit) | Atomic switch — `Dispatcher` retired, `Publisher` publishes per accepted event to `campaigns.fanout` (routing_key=workspace_id), new `cmd/campaign-worker/` consumes per-workspace queues with manual ack + DLQ on terminal nack. End-to-end trace continuity verified. 10 s burst @ c=5 = 345 events/s with 0 publish drops, 0 DLQ messages, queue depth = 0. |
+| `v0.1.7-fanout` | V2 PR 7 | Atomic switch — `Dispatcher` retired, `Publisher` publishes per accepted event to `campaigns.fanout` (routing_key=workspace_id), new `cmd/campaign-worker/` consumes per-workspace queues with manual ack + DLQ on terminal nack. End-to-end trace continuity verified. 10 s burst @ c=5 = 345 events/s with 0 publish drops, 0 DLQ messages, queue depth = 0. |
 | `v0.2.0-throughput` | V2 PR 8 (tagged) | V2-1 ceiling re-measured on the same hardware — fan-out **~2,800/s, zero loss (~14× V1's 196/s)**, new bottleneck named (per-event MySQL over the 25-conn pool). New Go `cmd/loadgen/` + `chaos/watch-fanout.sh` + `chaos/ceiling-run.sh`. Found + fixed two Go HTTP connection-leak bugs that were masking the ceiling. See [§ V2-1 ceiling](#v2-1-ceiling-measured-2026-05-29). |
 | `v0.2.x-segments` | V2 PRs 9–11 | V2-2. PR 9: `internal/segmentidx` engine (9 tests). PR 10: `cmd/segment-worker/` + `/check` repoint + `people.changes` feed. PR 11: campaign-worker hot-path repoint — campaign + attribute caches replace the per-event MySQL reads. Re-measured: worker backlog 9,134 → 83, ceiling migrated to shared MySQL writes ([§ V2-2 ceiling](#v2-2-hot-path-ceiling-measured-2026-05-29)). **Next:** write-side (read/write split, batch enrollment inserts, or shard). |
 | `v0.2.x-idempotency` | V2 PR 13 | V2-3 (Lean): migration 004 unique `(workspace_id, campaign_id, triggered_by)` + `INSERT … ON DUPLICATE KEY UPDATE` → redelivery never double-enrolls; `internal/campaign/batcher.go` coalesces enrollment inserts (~63 rows/flush). Backlog 156,961 → 166; 0 dup enrollments across 700k+ rows. Two-phase send-gate deferred to V3. |
-| `v0.3.0-durability` | V3 | Journey FSM · DLQs · per-workspace queue isolation (implementation or design-doc-only depending on interview timing) |
+| `v0.2.6-closeout` | Close-out review | Closed the specified-but-unbuilt per-workspace queue-depth metric (BM‑82/86 — RabbitMQ scrape with `workspace_id` relabeled from the queue name); made the batching A/B reachable from the host; hoisted the per-event trigger decode + template parse to once per cache refresh; added `messaging.consume.requeued` so an unbounded requeue is visible. **Fixed a silent-loss bug in `Publisher.Submit`** found by writing its first test — see [§ What broke](#what-broke-the-producers-shutdown-race). Spec: duplicate `BM‑30..32` renumbered, tier table filled, out-of-scope reconciled, Q12–Q14 recorded. |
+| `v0.3.0-durability` | V3 | Journey FSM · DLQs · retry-with-backoff + bounded requeue (Q13) · per-workspace queue isolation · two-phase send-gate (BM‑105) |
 
 ## Reading
 

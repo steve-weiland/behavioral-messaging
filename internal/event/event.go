@@ -11,7 +11,7 @@ import (
 // Event is what one Track API call records.
 type Event struct {
 	WorkspaceID string          `json:"workspace_id"`
-	EventID     string          `json:"event_id"`             // UUIDv4, server-assigned
+	EventID     string          `json:"event_id"` // UUIDv4, server-assigned
 	PersonID    string          `json:"person_id"`
 	Name        string          `json:"event_name"`
 	Payload     json.RawMessage `json:"payload"`
