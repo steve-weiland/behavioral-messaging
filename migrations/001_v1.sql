@@ -79,4 +79,13 @@ VALUES ('ws_alpha', 'Alpha (default development workspace)');
 -- queries SHOW GLOBAL STATUS + performance_schema views.
 GRANT PROCESS ON *.* TO 'bm'@'%';
 GRANT SELECT ON performance_schema.* TO 'bm'@'%';
+-- REPLICATION CLIENT looks out of place on a deliberately single-node MySQL,
+-- and it is not here to collect anything: the replica metrics are disabled in
+-- deploy/otel-collector.yaml. mysqlreceiver runs SHOW REPLICA STATUS on every
+-- scrape regardless of whether those metrics are enabled, so without this
+-- grant it logs "Error 1227 Access denied" four times a minute, forever, on
+-- the same log path the USE dashboard reads. The privilege is read-only
+-- metadata access; granting it makes the probe return zero rows quietly.
+-- Revisit if a read/write split ever lands (spec §6, V3/V4).
+GRANT REPLICATION CLIENT ON *.* TO 'bm'@'%';
 FLUSH PRIVILEGES;

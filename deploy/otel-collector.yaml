@@ -32,6 +32,18 @@ receivers:
     password: bm
     database: bm
     collection_interval: 15s
+    metrics:
+      # Replica-status metrics come from SHOW REPLICA STATUS, which needs the
+      # SUPER or REPLICATION CLIENT privilege the bm user doesn't have — and
+      # this build is deliberately single-node MySQL (a read/write split is a
+      # V3/V4 lever, see spec §6). Left enabled, the receiver logged
+      # "Failed to fetch replica status stats: Error 1227 Access denied"
+      # every collection_interval, i.e. 4×/minute forever, on the same log
+      # path the USE dashboard reads.
+      mysql.replica.sql_delay:
+        enabled: false
+      mysql.replica.time_behind_source:
+        enabled: false
 
   # V3 PR 10: host metrics. Inside Docker on macOS this reads the
   # Linux VM's /proc and /sys (bind-mounted at /hostfs in compose),
