@@ -2,9 +2,17 @@
 
 COMPOSE ?= docker compose
 
+# BM-133 knobs. The pool is deliberately small: with the production default of
+# 50 the bash-era load could never saturate it, which is why the first attempt
+# at this measurement showed the caps costing rather than buying.
+BM133_POOL     ?= 16
+BM133_WS       ?= 6
+BM133_TOTAL    ?= 12
+BM133_DURATION ?= 30
+
 .PHONY: help up down logs ps rebuild test fmt vet seed seed-people seed-segments seed-campaign showcase \
 	load load-prep load-quick load-soak seed-journey journey-runs \
-	dlq-inspect dlq-replay dlq-purge retry-queues noisy-prep noisy-neighbour \
+	dlq-inspect dlq-replay dlq-purge retry-queues noisy-prep noisy-neighbour bm133 \
 	mysql events-count people-count segments-count campaigns-count enrollments-count
 
 help:
@@ -112,8 +120,30 @@ noisy-prep: ## V3-3: create ws_noisy + ws_quiet with a campaign each, then resta
 	@echo "  restarting worker so it subscribes to the new workspaces"
 	@$(COMPOSE) restart campaign-worker >/dev/null 2>&1 && sleep 8 && echo "  ready"
 
-noisy-neighbour: ## V3-3: prove tenant isolation — one workspace floods, the other must stay served (BM-133)
+noisy-neighbour: ## V3-3: one workspace floods, the other must stay served (BM-133)
 	@./chaos/noisy-neighbour.sh
+
+bm133: ## V3-3: the full BM-133 A/B — caps on vs off, with a pool small enough that contention is reachable
+	@echo "Contention has to be REACHABLE for this to test anything: the worker runs"
+	@echo "with MYSQL_MAX_OPEN_CONNS=$(BM133_POOL) so a flooding tenant can actually"
+	@echo "saturate it. Caps are sized under the pool (per-ws $(BM133_WS), total $(BM133_TOTAL))"
+	@echo "so the quiet tenant always has a connection available."
+	@echo
+	@echo "--- A: caps ON ---"
+	@MYSQL_MAX_OPEN_CONNS=$(BM133_POOL) WORKSPACE_CAPS=on \
+	  MAX_INFLIGHT_PER_WORKSPACE=$(BM133_WS) MAX_INFLIGHT_TOTAL=$(BM133_TOTAL) \
+	  $(COMPOSE) up -d campaign-worker >/dev/null 2>&1
+	@sleep 10
+	@LABEL="caps=ON " DURATION=$(BM133_DURATION) ./chaos/noisy-neighbour.sh
+	@echo
+	@echo "--- B: caps OFF (V2 behavior — aggregate unbounded) ---"
+	@MYSQL_MAX_OPEN_CONNS=$(BM133_POOL) WORKSPACE_CAPS=off \
+	  $(COMPOSE) up -d campaign-worker >/dev/null 2>&1
+	@sleep 10
+	@LABEL="caps=OFF" DURATION=$(BM133_DURATION) ./chaos/noisy-neighbour.sh
+	@echo
+	@echo "Restoring defaults."
+	@$(COMPOSE) up -d campaign-worker >/dev/null 2>&1
 
 dlq-inspect: ## V3-2: DLQ depth + why each message gave up (BM-124)
 	@./chaos/dlq.sh inspect

@@ -470,6 +470,48 @@ behavioral-messaging/
                                     ceiling-run.sh (V2 measured-run orchestrator; pairs with cmd/loadgen/)
 ```
 
+## What the isolation tier taught
+
+V3-3 set out to prove tenant isolation: flood one workspace, show another stays
+served. Two runs, two negative results, and the second one is the interesting
+one.
+
+**First run (bad measurement).** Caps on vs off, measured by the quiet tenant's
+gateway latency. Both "passed" — which should have been the tell. The bash+curl
+driver tops out near 557/s (this repo measured that in V1), so it never
+saturated the 50-connection pool and the contention the caps arbitrate never
+happened. The caps only added latency.
+
+**Second run (bad assumption).** Fixed both flaws — drove the noisy tenant with
+`cmd/loadgen` at c=100, measured the quiet tenant's *queue depth* rather than
+intake latency, and shrank the pool to 16 so saturation was reachable:
+
+| | noisy max queue | **quiet max queue** | quiet p99 |
+|---|---|---|---|
+| caps **ON** | 167,461 | **1** | 27 ms |
+| caps **OFF** | 306,941 | **0** | 28 ms |
+
+The quiet tenant was untouched either way, 0/25 samples backed up in both arms.
+
+**Why: the isolation was already there, from V2-1.** Every workspace has its own
+queue and its own consumer, and `Qos(global=false)` gives each consumer its own
+prefetch. A noisy tenant's backlog accumulates in *its own* queue while its
+consumer holds at most `PREFETCH` unacked; a quiet tenant needing two
+connections a second gets them trivially, because the noisy work *completes* and
+returns connections rather than holding them. There is no starvation path to
+close.
+
+So V3-3's admission caps are **not justified as a fairness mechanism**. What they
+genuinely bound is *aggregate* concurrency against one shared pool across many
+busy workspaces — a real claim, but a different one, and unmeasured (spec
+BM‑135). Until it is, `WORKSPACE_CAPS=off` is the honest default: shipping a
+mechanism whose benefit has never been observed is how systems accumulate
+machinery nobody can justify.
+
+The tier ladder's premise — each tier raises the ceiling by making a real
+engineering decision — only holds if a tier is allowed to conclude that its
+decision wasn't needed.
+
 ## Why these decisions
 
 **MySQL, not Postgres.** Customer.io stack alignment + fills the CV gap
@@ -506,7 +548,7 @@ or log shipping. Day-1 dashboards.
 | `v0.2.x-segments` | V2 PRs 9–11 | V2-2. PR 9: `internal/segmentidx` engine (9 tests). PR 10: `cmd/segment-worker/` + `/check` repoint + `people.changes` feed. PR 11: campaign-worker hot-path repoint — campaign + attribute caches replace the per-event MySQL reads. Re-measured: worker backlog 9,134 → 83, ceiling migrated to shared MySQL writes ([§ V2-2 ceiling](#v2-2-hot-path-ceiling-measured-2026-05-29)). **Next:** write-side (read/write split, batch enrollment inserts, or shard). |
 | `v0.2.x-idempotency` | V2 PR 13 | V2-3 (Lean): migration 004 unique `(workspace_id, campaign_id, triggered_by)` + `INSERT … ON DUPLICATE KEY UPDATE` → redelivery never double-enrolls; `internal/campaign/batcher.go` coalesces enrollment inserts (~63 rows/flush). Backlog 156,961 → 166; 0 dup enrollments across 700k+ rows. Two-phase send-gate deferred to V3. |
 | `v0.2.6-closeout` | Close-out review | Closed the specified-but-unbuilt per-workspace queue-depth metric (BM‑82/86 — RabbitMQ scrape with `workspace_id` relabeled from the queue name); made the batching A/B reachable from the host; hoisted the per-event trigger decode + template parse to once per cache refresh; added `messaging.consume.requeued` so an unbounded requeue is visible. **Fixed a silent-loss bug in `Publisher.Submit`** found by writing its first test — see [§ What broke](#what-broke-the-producers-shutdown-race). Spec: duplicate `BM‑30..32` renumbered, tier table filled, out-of-scope reconciled, Q12–Q14 recorded. |
-| `v0.3.4-isolation` | V3-3 (partial) | Per-workspace admission caps under a global ceiling sized below the MySQL pool, plus a fair scheduler claim so one tenant's overdue backlog can't monopolize every batch. **The isolation demo is an honest negative so far:** the mechanism throttles exactly as designed (noisy tenant pinned at its cap with 11,496 admission waits and 8,274 backlogged; quiet tenant queue 0), but with caps *off* the quiet tenant was equally unaffected at a *better* p99 — the bash driver never saturated the shared pool, so the contention the caps arbitrate never occurred. Needs `cmd/loadgen` and/or a constrained pool to be a real demonstration. |
+| `v0.3.5-isolation` | V3-3 | Per-workspace admission caps + a fair scheduler claim (one tenant's overdue backlog can no longer monopolize every batch — that gap was real). **The isolation measurement disproved its own premise, and that's the finding.** See [§ What the isolation tier taught](#what-the-isolation-tier-taught). |
 | `v0.3.3-retry` | V3-2 | Retry ladder (5s/30s/2m/10m TTL queues dead-lettering back to the work exchange) replacing V2's immediate-and-forever requeue, plus a DLQ that carries *why* it gave up and `chaos/dlq.sh` to inspect and replay it. Scheduler-side retries got the same bound. Verified by stopping MySQL: a message climbed 5s → 30s while the failure was transient, then dead-lettered as `terminal` once the real cause surfaced; `dlq-replay` drained 2 → 0 after the cause was fixed, and the work completed. |
 | `v0.3.2-scheduler` | V3-1b | `cmd/journey-scheduler`: claims due runs with `FOR UPDATE SKIP LOCKED` (so replicas need no distributed lock), commits the claim before doing step work, holds a lease so a dead replica's runs are reclaimed, and gates every send on `idempotency_keys` keyed `run_id:step_index`. Verified exactly-once two ways — a simulated crash-after-POST and a real `docker kill` mid-journey. Found and fixed a fall-through bug: branch arms are ranges in a flat list, so the `if_true` arm ran into the `if_false` arm and one person got both messages; `then:"end"` fixes it without a fourth step type. |
 | `v0.3.1-journeys` | V3-1a | `journeys` + `journey_runs` schema, `internal/journey`, `POST/GET /journeys`, and enrollment on the per-event path — one run row per trigger, idempotent under redelivery (BM‑113, verified with a real duplicate delivery). The journey list is cached per workspace from day one: a per-event `ListByWorkspace` would have reintroduced the exact V2-1 bottleneck V2-2c removed. No scheduler yet, so runs sit at `step_index=0` waiting for V3-1b. |
