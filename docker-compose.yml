@@ -194,6 +194,11 @@ services:
       BATCH_WINDOW: "${BATCH_WINDOW:-10ms}"
       # V3-2 retry ladder; off restores V2's immediate-and-forever requeue.
       RETRY_LADDER: "${RETRY_LADDER:-on}"
+      # V3-1a journey enrollment; off is the pure-V2 A/B baseline for BM-140.
+      # Must be declared here or `JOURNEYS=off make up` silently does nothing —
+      # a mistake this project has now made three times (CAMPAIGN_BATCH, then
+      # the journey `then` field, now this).
+      JOURNEYS: "${JOURNEYS:-on}"
       PORT: "8082"
     ports:
       - "8092:8082"
