@@ -538,22 +538,40 @@ func (s *Scheduler) fail(ctx context.Context, r *Run, reason string) {
 		slog.String("run_id", r.RunID), slog.String("reason", reason))
 }
 
-// release puts a run back as due, recording why. Used for transient failures;
-// V3-2 replaces the immediate retry with a backoff ladder.
+// schedulerBackoff is the FSM-side ladder (BM-123). The scheduler needs no
+// broker for retries: wake_at already exists, so the delay mechanism IS the
+// retry mechanism — and unlike a broker-side retry of a scheduler action, these
+// survive a scheduler restart because they live in the row.
+var schedulerBackoff = []time.Duration{
+	5 * time.Second, 30 * time.Second, 2 * time.Minute, 10 * time.Minute,
+}
+
+// release puts a run back as due after a transient failure, spaced by the
+// backoff ladder. Past the end of the ladder the run is failed rather than
+// retried forever — the bound is the point (BM-121/123).
 func (s *Scheduler) release(ctx context.Context, r *Run, reason string) {
+	next := int(r.Attempt) // attempt is the count of prior failures
+	if next >= len(schedulerBackoff) {
+		s.fail(ctx, r, fmt.Sprintf("retries exhausted after %d attempts: %s", r.Attempt, reason))
+		return
+	}
+	delay := schedulerBackoff[next]
 	const q = `
 		UPDATE journey_runs
 		SET status = 'ready', attempt = attempt + 1, last_error = ?,
-		    wake_at = DATE_ADD(NOW(), INTERVAL 5 SECOND),
+		    wake_at = DATE_ADD(NOW(), INTERVAL ? SECOND),
 		    claimed_by = NULL, claim_expires_at = NULL
 		WHERE workspace_id = ? AND run_id = ?
 	`
-	if _, err := s.db.ExecContext(ctx, q, truncate(reason, 500), r.WorkspaceID, r.RunID); err != nil {
+	if _, err := s.db.ExecContext(ctx, q, truncate(reason, 500), int(delay.Seconds()),
+		r.WorkspaceID, r.RunID); err != nil {
 		slog.ErrorContext(ctx, "release failed", slog.String("run_id", r.RunID), slog.Any("error", err))
 	}
 	slog.WarnContext(ctx, "journey run released for retry",
 		slog.String("run_id", r.RunID), slog.String("reason", reason),
-		slog.Uint64("attempt", uint64(r.Attempt+1)))
+		slog.Uint64("attempt", uint64(r.Attempt+1)),
+		slog.Int("of", len(schedulerBackoff)),
+		slog.Duration("backoff", delay))
 }
 
 func truncate(s string, n int) string {

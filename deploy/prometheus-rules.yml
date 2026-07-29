@@ -93,3 +93,44 @@ groups:
           summary: "Slow burn — POST /events SLO budget exhausting in <5d"
           description: "Error ratio over 6h and 30m windows both exceed 6× the steady-state burn."
           runbook_url: "https://github.com/steveweiland/behavioral-messaging/blob/main/RUNBOOK.md#burn-rate-ticket"
+
+  # V3-2 (BM-125): the two failure shapes need separate alerts, because
+  # neither one is visible in the other's signal.
+  - name: campaign-delivery-failures
+    rules:
+      - alert: CampaignDLQNonEmpty
+        # A DLQ with anything in it means we gave up on a message. Ticket, not
+        # page: nothing is being lost (it's durable and replayable via
+        # `make dlq-replay`), but someone has to look and decide.
+        expr: rabbitmq_detailed_queue_messages{queue="campaigns.fanout.dlq"} > 0
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Dead-lettered campaign deliveries are sitting in the DLQ"
+          description: "{{ $value }} message(s) exhausted the retry ladder or failed terminally. Inspect with `make dlq-inspect`, replay with `make dlq-replay`."
+
+      - alert: CampaignPoisonMessageSpinning
+        # The signature an empty DLQ cannot show you: a delivery being
+        # redelivered over and over. Pre-V3-2 this was the only failure mode
+        # and it looked like health. Kept as a page even after the retry ladder
+        # landed, because a sustained requeue rate now means the LADDER itself
+        # is failing to schedule (broker trouble), which is worse.
+        expr: sum(rate(messaging_consume_requeued_total{redelivered="true"}[5m])) > 0.2
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "Deliveries are being requeued repeatedly — retry ladder may be failing"
+          description: "Sustained redelivered=true requeue rate with no DLQ growth means messages are spinning rather than climbing the ladder."
+
+      - alert: CampaignRetryLadderSaturating
+        # Retries are normal; a rising top rung is not. If the 10m tier is
+        # filling, the next stop is the DLQ.
+        expr: rabbitmq_detailed_queue_messages{queue="campaigns.retry.10m"} > 50
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Top retry tier is backing up — dead-lettering is imminent"
+          description: "{{ $value }} message(s) on the final rung. Check the downstream that keeps failing before they exhaust."

@@ -4,6 +4,7 @@ COMPOSE ?= docker compose
 
 .PHONY: help up down logs ps rebuild test fmt vet seed seed-people seed-segments seed-campaign showcase \
 	load load-prep load-quick load-soak seed-journey journey-runs \
+	dlq-inspect dlq-replay dlq-purge retry-queues \
 	mysql events-count people-count segments-count campaigns-count enrollments-count
 
 help:
@@ -99,6 +100,18 @@ seed-journey: ## V3-1a: define a journey, fire a trigger, then REDELIVER it — 
 	  sleep 4
 	@echo "6. run count for onboard_pro (BM-113 — expect exactly 1):"
 	@$(MAKE) -s journey-runs
+
+dlq-inspect: ## V3-2: DLQ depth + why each message gave up (BM-124)
+	@./chaos/dlq.sh inspect
+
+dlq-replay: ## V3-2: drain the DLQ back onto the work exchange, attempts reset (BM-124)
+	@./chaos/dlq.sh replay
+
+dlq-purge: ## Empty the DLQ (destructive — inspect first)
+	@./chaos/dlq.sh purge
+
+retry-queues: ## Show retry-ladder queue depths
+	@./chaos/dlq.sh inspect | head -6
 
 journey-runs: ## Count + show journey_runs rows
 	@$(COMPOSE) exec -T mysql mysql -ubm -pbm bm -e \

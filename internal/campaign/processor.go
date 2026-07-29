@@ -136,7 +136,11 @@ func (p *Processor) getPerson(ctx context.Context, workspaceID, personID string)
 //     worth retrying
 //   - OutcomeNackDrop    — terminal: person row missing (race vs delete),
 //     will route to the DLQ
-func (p *Processor) Process(parent context.Context, ev event.Event) amqpx.Outcome {
+//
+// Process returns the outcome plus a human-readable reason (empty on success).
+// The reason travels onto the retry header and into the DLQ, because a DLQ you
+// intend to drain needs to say why it gave up (BM-121/124).
+func (p *Processor) Process(parent context.Context, ev event.Event) (amqpx.Outcome, string) {
 	tracer := otel.Tracer("campaigns")
 	ctx, span := tracer.Start(parent, "campaign.process",
 		trace.WithSpanKind(trace.SpanKindInternal),
@@ -156,14 +160,14 @@ func (p *Processor) Process(parent context.Context, ev event.Event) amqpx.Outcom
 			slog.String("workspace_id", ev.WorkspaceID),
 			slog.Any("error", err))
 		span.RecordError(err)
-		return amqpx.OutcomeNackRequeue
+		return amqpx.OutcomeNackRequeue, "campaign list failed: " + err.Error()
 	}
 	// Nothing to do only when BOTH paths are idle. Gating on campaigns alone
 	// would silently skip journey enrollment in any workspace that has
 	// journeys but no campaigns — which is exactly the state a fresh V3
 	// install is in.
 	if len(campaigns) == 0 && p.enroller == nil {
-		return amqpx.OutcomeAck
+		return amqpx.OutcomeAck, ""
 	}
 
 	// The person is needed by both paths: campaign triggers and journey
@@ -177,7 +181,7 @@ func (p *Processor) Process(parent context.Context, ev event.Event) amqpx.Outcom
 			slog.String("workspace_id", ev.WorkspaceID),
 			slog.String("person_id", ev.PersonID))
 		span.RecordError(err)
-		return amqpx.OutcomeNackDrop
+		return amqpx.OutcomeNackDrop, "person row missing (deleted after publish)"
 	}
 	if err != nil {
 		slog.ErrorContext(ctx, "person get failed during campaign processing",
@@ -185,7 +189,7 @@ func (p *Processor) Process(parent context.Context, ev event.Event) amqpx.Outcom
 			slog.String("person_id", ev.PersonID),
 			slog.Any("error", err))
 		span.RecordError(err)
-		return amqpx.OutcomeNackRequeue
+		return amqpx.OutcomeNackRequeue, "person read failed: " + err.Error()
 	}
 
 	// For each campaign whose trigger matches, render + dispatch + record.
@@ -195,6 +199,7 @@ func (p *Processor) Process(parent context.Context, ev event.Event) amqpx.Outcom
 	// (uniq_enrollment_dispatch): re-dispatched campaigns re-enroll as
 	// no-ops, only the stub re-POSTs (harmless for the stub sink).
 	requeue := false
+	reason := ""
 	for i := range campaigns {
 		c := &campaigns[i]
 		if !p.triggerMatches(ctx, c, per, ev) {
@@ -255,13 +260,14 @@ func (p *Processor) Process(parent context.Context, ev event.Event) amqpx.Outcom
 				slog.Any("error", err))
 			span.RecordError(err)
 			requeue = true
+			reason = "journey enrollment failed: " + err.Error()
 		}
 	}
 
 	if requeue {
-		return amqpx.OutcomeNackRequeue
+		return amqpx.OutcomeNackRequeue, reason
 	}
-	return amqpx.OutcomeAck
+	return amqpx.OutcomeAck, ""
 }
 
 func (p *Processor) triggerMatches(ctx context.Context, c *Campaign, per *person.Person, ev event.Event) bool {

@@ -107,6 +107,11 @@ func main() {
 	if err := campaign.DeclareProducerTopology(amqpCh); err != nil {
 		log.Fatalf("amqp topology: %v", err)
 	}
+	// V3-2: the retry ladder. Declared here as well as producer-side so the
+	// rungs exist even if the worker boots first.
+	if err := campaign.DeclareRetryTopology(amqpCh); err != nil {
+		log.Fatalf("amqp retry topology: %v", err)
+	}
 
 	// V2-2c hot path. Default "cache": serve per-event campaign list +
 	// person attributes from in-process caches (no MySQL read per event).
@@ -172,6 +177,16 @@ func main() {
 		slog.Info("journey enrollment disabled")
 	}
 
+	// RETRY_LADDER=off falls back to V2's immediate requeue, kept as the A/B
+	// baseline for showing what bounded retry changed.
+	var retrier *campaign.Retrier
+	if envOr("RETRY_LADDER", "on") != "off" {
+		retrier = campaign.NewRetrier(amqpCh)
+		slog.Info("retry ladder enabled", slog.Int("tiers", len(campaign.RetryLadder)))
+	} else {
+		slog.Info("retry ladder disabled (immediate requeue — V2 behavior)")
+	}
+
 	processor := campaign.NewProcessorWithCaches(db, httpClient, stubURL, attrCache, campCache, batcher)
 	if enroller != nil {
 		// Guarded: passing a nil *journey.Enroller through the interface
@@ -192,7 +207,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("ensure queue %s: %v", ws, err)
 		}
-		handler := makeHandler(processor)
+		handler := makeHandler(processor, retrier)
 		consumerTag := serviceName + "." + ws
 		if err := amqpx.Consume(rootCtx, amqpCh, queueName, prefetch, consumerTag, handler); err != nil {
 			log.Fatalf("consume %s: %v", queueName, err)
@@ -234,19 +249,56 @@ func main() {
 	// drop. V2-1's at-least-once posture covers the redelivery case.
 }
 
-// makeHandler wraps the Processor in the amqpx.Handler signature.
-// Decode failure is terminal (poison message → DLQ); everything else
-// delegates to Processor.Process which returns the Outcome.
-func makeHandler(p *campaign.Processor) amqpx.Handler {
+// makeHandler wraps the Processor in the amqpx.Handler signature and applies
+// the V3-2 failure policy (BM-120/121/126).
+//
+// The classification lives here, explicitly, rather than being inferred from
+// error strings:
+//
+//	terminal  — decode failure, person row missing. Retrying renders the same
+//	            failure, so it goes straight to the DLQ with a reason.
+//	transient — MySQL/broker/stub failures. Climbs the retry ladder; the
+//	            original delivery is then ACKed because the message is durably
+//	            on the retry queue.
+//	exhausted — off the top of the ladder → DLQ, cause=exhausted.
+//
+// The old immediate Nack(requeue=true) is gone: it retried forever at full
+// speed while the DLQ stayed empty and looked healthy.
+func makeHandler(p *campaign.Processor, r *campaign.Retrier) amqpx.Handler {
 	return func(ctx context.Context, d amqp.Delivery) amqpx.Outcome {
 		var ev event.Event
 		if err := json.Unmarshal(d.Body, &ev); err != nil {
 			slog.ErrorContext(ctx, "decode event from AMQP body",
 				slog.String("message_id", d.MessageId),
 				slog.Any("error", err))
+			if r != nil {
+				if derr := r.DeadLetter(ctx, d, "", "undecodable body: "+err.Error(), "terminal"); derr == nil {
+					return amqpx.OutcomeAck
+				}
+			}
 			return amqpx.OutcomeNackDrop
 		}
-		return p.Process(ctx, ev)
+		outcome, reason := p.Process(ctx, ev)
+		if r == nil {
+			return outcome // retry ladder disabled — V2 behavior
+		}
+		switch outcome {
+		case amqpx.OutcomeNackRequeue:
+			if _, _, err := r.Retry(ctx, d, ev.WorkspaceID, reason); err != nil {
+				// Couldn't even schedule the retry (broker trouble). Fall back
+				// to the old requeue so the message isn't lost.
+				slog.ErrorContext(ctx, "retry scheduling failed — falling back to requeue",
+					slog.Any("error", err))
+				return amqpx.OutcomeNackRequeue
+			}
+			return amqpx.OutcomeAck
+		case amqpx.OutcomeNackDrop:
+			if err := r.DeadLetter(ctx, d, ev.WorkspaceID, reason, "terminal"); err != nil {
+				return amqpx.OutcomeNackDrop
+			}
+			return amqpx.OutcomeAck
+		}
+		return outcome
 	}
 }
 

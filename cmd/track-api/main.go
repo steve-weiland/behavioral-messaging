@@ -82,10 +82,16 @@ func main() {
 	if err := campaign.DeclareProducerTopology(amqpCh); err != nil {
 		log.Fatalf("amqp topology: %v", err)
 	}
+	// V3-2 retry ladder — declared producer-side so the rungs exist before the
+	// first failure can need them.
+	if err := campaign.DeclareRetryTopology(amqpCh); err != nil {
+		log.Fatalf("amqp retry topology: %v", err)
+	}
 	slog.Info("amqp topology declared",
 		slog.String("exchange", campaign.ExchangeFanout),
 		slog.String("dlx", campaign.ExchangeDLX),
-		slog.String("dlq", campaign.QueueDLQ))
+		slog.String("dlq", campaign.QueueDLQ),
+		slog.Int("retry_tiers", len(campaign.RetryLadder)))
 
 	// V2-1b: the Publisher replaces V1's in-process Dispatcher. The
 	// /events handler hands accepted events to Submit; a single
