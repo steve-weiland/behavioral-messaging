@@ -501,12 +501,32 @@ connections a second gets them trivially, because the noisy work *completes* and
 returns connections rather than holding them. There is no starvation path to
 close.
 
-So V3-3's admission caps are **not justified as a fairness mechanism**. What they
-genuinely bound is *aggregate* concurrency against one shared pool across many
-busy workspaces — a real claim, but a different one, and unmeasured (spec
-BM‑135). Until it is, `WORKSPACE_CAPS=off` is the honest default: shipping a
-mechanism whose benefit has never been observed is how systems accumulate
-machinery nobody can justify.
+So V3-3's admission caps were **not justified as a fairness mechanism**. That
+left one hypothesis: maybe they bound *aggregate* concurrency usefully — N
+workspaces × prefetch goroutines thrashing one pool.
+
+**Third run (BM‑135), and the caps lost.** 8 simultaneously busy workspaces,
+c=25 each (≈200 aggregate concurrency), pool of 16, identical 41-second windows:
+
+| | enrollments | aggregate fan-out |
+|---|---|---|
+| caps **OFF** | 220,960 | **5,389/s** |
+| caps **ON** | 31,548 | **769/s** |
+
+A **7× throughput loss for no measured benefit.** The premise was wrong in the
+opposite direction from expected: MySQL and the connection pool handle
+oversubscription gracefully — requests queue briefly and complete — whereas a
+hard in-flight cap of 12 limits the worker to 12 concurrent however much
+capacity is free.
+
+**So the caps were deleted.** `internal/campaign/limiter.go`, its wiring, and its
+compose knobs are gone. The spec keeps BM‑130 and BM‑135 as *withdrawn*
+requirements rather than deleting them, because the reasoning is the artefact: a
+plausible mechanism, argued from first principles, killed by measurement.
+
+**What survives from V3-3:** the fair scheduler claim. `ORDER BY wake_at LIMIT n`
+genuinely did let one tenant's overdue backlog fill every batch forever — that
+gap was real, and it's closed.
 
 The tier ladder's premise — each tier raises the ceiling by making a real
 engineering decision — only holds if a tier is allowed to conclude that its

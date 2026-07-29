@@ -194,12 +194,6 @@ services:
       BATCH_WINDOW: "${BATCH_WINDOW:-10ms}"
       # V3-2 retry ladder; off restores V2's immediate-and-forever requeue.
       RETRY_LADDER: "${RETRY_LADDER:-on}"
-      # V3-3 admission caps (BM-130). The global ceiling sits below the MySQL
-      # pool so in-flight work never queues on connections; each workspace gets
-      # a slice. WORKSPACE_CAPS=off is the noisy-neighbour A/B baseline.
-      WORKSPACE_CAPS: "${WORKSPACE_CAPS:-on}"
-      MAX_INFLIGHT_TOTAL: "${MAX_INFLIGHT_TOTAL:-40}"
-      MAX_INFLIGHT_PER_WORKSPACE: "${MAX_INFLIGHT_PER_WORKSPACE:-8}"
       PORT: "8082"
     ports:
       - "8092:8082"
