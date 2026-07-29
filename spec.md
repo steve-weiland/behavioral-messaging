@@ -2,10 +2,10 @@
 
 | Field   | Value                                  |
 |---------|----------------------------------------|
-| Version | 0.2.8                                  |
+| Version | 0.3.1 (V3-1a built)                     |
 | Author  | Steve Weiland                          |
 | Date    | 2026-07-28                             |
-| Status  | V1 + V2 complete (V3 designed, unbuilt) |
+| Status  | V1 + V2 complete; V3 in progress (V3-1a) |
 
 ---
 
@@ -45,6 +45,9 @@ Multi-tenancy is **not** a tier — it's a cross-cutting V1 property
 | Segment | Named set of persons matching a boolean condition tree over attributes + event history. V1 evaluates by scan; V2 by roaring bitmap with incremental membership maintenance. |
 | Campaign | A trigger condition + a message template. V1: single-step send on event match. V3: multi-step journey with delays + branches. |
 | Journey enrollment | The audit record when a campaign enrolls a person, with `event_id` cross-reference. |
+| Journey *(V3)* | An ordered list of steps, plus a trigger. Three step types only (Q9): `send`, `delay`, `branch_on_condition`. Versioned — editing bumps the version and leaves in-flight runs alone (BM‑114). |
+| Journey run *(V3)* | One person's position in one journey: step index, status, and `wake_at`. The unit the scheduler claims and advances. A V2 campaign is the degenerate case — a single `send` step that completes on creation. |
+| Lease *(V3)* | `claimed_by` + `claim_expires_at` on a run. Lets a crashed scheduler's work be reclaimed without holding a DB transaction across an HTTP send — which is why reclaim requires the send-gate to avoid double-sending (BM‑117/118). |
 | Stub receiver | V1's stand-in for a delivery provider (ESP / APNs / FCM / webhook). HTTP receiver that logs the payload. |
 | Idempotency key | `(workspace_id, person_id, campaign_id, schedule_key)` row guaranteeing at-most-once *dispatch* even under retry. **Deferred to V3** (BM‑105) — the `idempotency_keys` table exists (BM‑13) but is unwritten. What V2-3 shipped instead is *enrollment* idempotency: a UNIQUE natural key on `journey_enrollments` making redelivery a no-op at the audit layer (BM‑100). Redelivery cannot double-enroll; it can still double-*send*. |
 
@@ -333,10 +336,113 @@ comparison is batching-on-vs-off backlog, not the absolute number.)*
 
 ### 3.3 V3 — Durability
 
-*Drafted in PR 3's spec bump if implemented; otherwise written as a
-standalone design doc. Three mechanism subsections: persisted journey
-FSM with `SKIP LOCKED` scheduler, DLQs + retry, per-workspace queue
-isolation.*
+**Design complete; implementation in progress.** V3-1a is built and verified
+(see §3.3.5); the rest is designed to the level where each PR is a mechanical
+read, with the decisions and their costs named up front.
+
+#### V3 does not raise the throughput ceiling. It spends throughput.
+
+Every prior tier removed a constraint and measured a higher number. V3 will
+not, and the spec should say so before the numbers come in and look like a
+regression.
+
+V2 ended write-bound on one MySQL: two `INSERT`s per event (event + enrollment)
+at ~2,700/s. V3 adds durable per-person state that has to be *transitioned*,
+and every transition is a write. A three-step journey costs roughly:
+
+| Work | V2 | V3 (3-step journey) |
+|---|---|---|
+| Per event | 2 writes (event, enrollment) | 3 (event, enrollment, run create) |
+| Per step | — | 1 claim `UPDATE` + 1 state `UPDATE` |
+| Per send step | — | +2 (`idempotency_keys` `sending` → `sent`) |
+| **Total per enrolled person** | **2** | **~10** |
+
+So the honest prediction is a **3–5× reduction in sustained end-to-end
+throughput on the same hardware**, and the artefact for this tier is the
+trade, stated in both directions: what durability bought (no lost journeys
+across a crash, bounded retries, a DLQ that can be drained) against what it
+cost (throughput, and a scheduler that competes with intake for the very
+resource already at its limit).
+
+Two structural rules follow, and both are load-bearing:
+
+1. **The FSM must not sit on the per-event fan-out path.** The campaign-worker
+   keeps doing what V2 measured — match the trigger, write one row — and that
+   row is now a *run* at step 0. Advancing runs is the scheduler's job. If
+   step execution happened inline per event, V2's measured hot path would be
+   invalidated and every number in §3.2 would need re-taking.
+2. **The scheduler must batch and must not poll blindly.** It shares the
+   bottleneck it is adding load to. Claim in batches; sleep until the next
+   `wake_at` rather than on a fixed tick.
+
+#### 3.3.1 V3-1 — Persisted journey FSM (BM‑110..119)
+
+A journey is an ordered step list; a *run* is one person's position in it.
+Q9 caps step types at three, which is enough for the interview answer and
+small enough to finish: `send`, `delay`, `branch_on_condition`.
+
+| ID | Requirement |
+|----|-------------|
+| `BM‑110` | A `journeys` table **MUST** hold `(workspace_id, journey_id, name, trigger, steps, version, created_at, updated_at)` — `trigger` a `segment.Condition` tree (BM‑31 grammar, reused verbatim a third time), `steps` a JSON array. `POST /journeys` **MUST** validate the trigger and every step at insert time: unknown step type, out-of-range branch target, unparseable template, or negative delay **MUST** return `400`. |
+| `BM‑111` | Step types **MUST** be exactly three: `send {template}`, `delay {seconds}`, `branch_on_condition {condition, if_true, if_false}` where the branch targets are step indices. Forward-only jumps **MUST** be enforced at validation time — a backward target is rejected. This makes every run monotonic and therefore terminating, which is what lets the scheduler treat a stuck run as a bug rather than a legitimate loop. |
+| `BM‑112` | A `journey_runs` table **MUST** hold per-person execution state: `(workspace_id, run_id, journey_id, journey_version, person_id, step_index, status, wake_at, attempt, last_error, claimed_by, claim_expires_at, created_at, updated_at)` with `status ENUM('ready','waiting','running','done','failed','cancelled')`. PK `(workspace_id, run_id)`; a UNIQUE natural key **MUST** prevent duplicate enrollment (see BM‑113); and an index on `(status, wake_at)` **MUST** serve the scheduler's due query. |
+| `BM‑113` | Run creation **MUST** be idempotent against at-least-once delivery, by the same mechanism V2-3 used for enrollments: UNIQUE `(workspace_id, journey_id, triggered_by)` + `INSERT … ON DUPLICATE KEY UPDATE`. A redelivered trigger event **MUST NOT** create a second run. |
+| `BM‑114` | Runs **MUST** pin `journey_version` at creation and execute against that version's steps for their whole life. Editing a journey **MUST** bump `version` and **MUST NOT** alter in-flight runs. A person mid-way through a 5-step journey whose definition changes underneath them is a correctness bug and a support nightmare; pinning is cheaper than reconciling. |
+| `BM‑115` | A `journey-scheduler` service **MUST** advance runs. Per tick it **MUST** claim a bounded batch with `SELECT … WHERE status IN ('ready','waiting') AND wake_at <= NOW() ORDER BY wake_at LIMIT :batch FOR UPDATE SKIP LOCKED`, mark them `running` with `claimed_by` + `claim_expires_at`, and commit the claim before doing any step work. `SKIP LOCKED` is what makes N scheduler replicas safe without a distributed lock. |
+| `BM‑116` | The scheduler **MUST NOT** poll on a fixed interval when idle. After an empty claim it **MUST** sleep until `MIN(wake_at)` (one indexed query), bounded by `SCHEDULER_MAX_SLEEP` (default 5 s) so newly created runs are noticed. Rationale: a 1 s fixed tick against a write-saturated MySQL spends its budget on empty `SELECT`s — the thing V2-2 spent three PRs removing from the fan-out path. |
+| `BM‑117` | Step execution **MUST** be crash-safe without holding a transaction across the side effect. A `running` run whose `claim_expires_at` has passed **MUST** be reclaimable by any scheduler. Because a `send` step has an external effect, reclaim **MUST** be paired with the send-gate (BM‑118) — lease expiry alone guarantees at-*least*-once, not at-most-once. |
+| `BM‑118` | **BM‑105 is promoted from deferred to required here.** A `send` step **MUST** gate on `idempotency_keys` with the deterministic key `run_id:step_index`: insert `status='sending'` (unique, so a concurrent or reclaimed attempt loses the race and skips), POST, then update to `sent`. A key stuck in `sending` past a timeout **MUST** be resolvable — either retried (accepting a possible double-send and logging it) or failed — and which one it is **MUST** be a documented, configurable choice, because that is the honest shape of the at-least-once/at-most-once tradeoff against a downstream with no idempotency of its own. The V2-3 rationale for deferring (a stub sink can't double-charge anyone) expires the moment a real sender exists, and a reclaimable FSM makes double-send reachable in normal operation rather than only under crash. |
+| `BM‑119` | Delay precision **MUST** be documented as a lower bound, not a target: a run wakes *no earlier* than `wake_at`, with actual latency ≈ scheduler sleep + claim contention + step duration. `delay` is therefore suitable for "wait 3 days", not "wait 200 ms". |
+
+#### 3.3.2 V3-2 — Retry, backoff, and a DLQ that fills (BM‑120..129)
+
+Resolves **Q13**. V2-1 wired a DLQ and left it empty; V2's requeue is
+unbounded, so a message that can never succeed spins forever and the empty
+DLQ reads as health.
+
+| ID | Requirement |
+|----|-------------|
+| `BM‑120` | Transient failures **MUST** be retried with spacing, not immediate requeue. Mechanism: a TTL ladder of retry queues (`campaigns.retry.5s`, `.30s`, `.2m`, `.10m`), each with `x-message-ttl` and a DLX pointing back at the work exchange. A transient failure republishes to the next tier instead of `nack(requeue=true)`. |
+| `BM‑121` | Attempts **MUST** be bounded. The attempt count travels in a header (`x-attempt`); on exhausting the ladder the message **MUST** be published to the DLQ with a failure reason, the original routing key, and the accumulated `x-death` chain. |
+| `BM‑122` | The `amqpx.Outcome` enum **MUST** grow a `OutcomeRetry` case so the *decision* stays in the handler and the *mechanism* stays in `amqpx` — the same split V2-1 already established. `OutcomeNackRequeue` **SHOULD** be removed once the ladder exists; keeping both invites the unbounded path back in. |
+| `BM‑123` | Scheduler-side retries **MUST** reuse the FSM's own clock rather than the broker's: a failed step increments `attempt` and sets `wake_at = NOW() + backoff(attempt)`. Note this falls out for free — **the delay mechanism *is* the retry mechanism** — and it means step retries survive a scheduler restart, which a broker-side retry of a scheduler action would not. |
+| `BM‑124` | The DLQ **MUST** be operable, not just present: `make dlq-inspect` (count + reasons + oldest age) and `make dlq-replay` (republish to the work exchange with `x-attempt` reset). A DLQ nobody can drain is a landfill with a dashboard. |
+| `BM‑125` | Alerts **MUST** cover both failure shapes: DLQ depth > 0 sustained → ticket; `messaging.consume.requeued{redelivered="true"}` rate sustained non-zero → page (that is the poison-spin signature, and it is invisible in DLQ depth by construction). |
+| `BM‑126` | Terminal vs transient classification **MUST** be explicit per failure, not inferred from error strings. Person-missing, template-render, and decode failures are terminal (→ DLQ, no retry); MySQL connection errors, broker errors, and stub 5xx/timeouts are transient (→ ladder). A 4xx from a real sender is terminal. |
+
+#### 3.3.3 V3-3 — Per-workspace isolation (BM‑130..139)
+
+V2-1 gave every workspace **its own queue**. It did not give any workspace its
+own **capacity** — one worker process consumes all queues against one shared
+`PREFETCH` budget and one shared MySQL pool. So a workspace with a 100k
+backlog takes the lion's share of both, and a quiet tenant's events queue
+behind it. Per-workspace queues without per-workspace capacity is isolation
+theatre; this is the tier that makes it real.
+
+| ID | Requirement |
+|----|-------------|
+| `BM‑130` | The worker **MUST** cap in-flight work per workspace (`MAX_INFLIGHT_PER_WORKSPACE`), not just globally. A single workspace **MUST NOT** be able to consume the whole prefetch budget or the whole MySQL pool. |
+| `BM‑131` | The scheduler's due-run claim **MUST** be fair across workspaces. `ORDER BY wake_at LIMIT n` alone lets one workspace's backlog of overdue runs starve every other tenant indefinitely — the claim **MUST** round-robin across workspaces with a per-workspace cap per tick. |
+| `BM‑132` | Per-workspace throughput, in-flight count, and queue depth **MUST** be observable (extends BM‑82's queue-depth scrape to the worker's own view of concurrency). |
+| `BM‑133` | Isolation **MUST** be demonstrated, not asserted: a noisy-neighbour run where workspace A is flooded while workspace B receives steady light traffic, and **B's end-to-end p99 stays within a documented bound**. This is the tier's headline artefact — "one tenant cannot hurt another, here is the graph" is the multi-tenancy claim a reviewer actually cares about. |
+| `BM‑134` | Per-workspace **rate limiting** **MAY** be added on the same seam as BM‑130 (a token bucket keyed by workspace). Called out because it is where send quotas would live if they moved in from V4. |
+
+#### 3.3.4 V3 ceiling (to be measured — BM‑140)
+
+| ID | Requirement |
+|----|-------------|
+| `BM‑140` | The V3 ceiling **MUST** be re-measured with the same driver on the same hardware, and reported as a *trade* rather than an improvement: sustained enrolled-persons/s with a 3-step journey, against V2's 2,700/s single-step baseline. The writeup **MUST** name the new dominant write and say whether the prediction above (3–5× reduction, still MySQL-write-bound, now dominated by FSM transitions) held. **Predicted new bottleneck:** MySQL writes, with the mix shifted from intake to state transitions — which is the argument for V4 (read/write split, sharding by `workspace_id`, or moving run state to storage better suited to high-churn rows than an InnoDB table with a hot secondary index). |
+
+#### 3.3.5 V3 milestones
+
+| # | PR | Done when |
+|---|----|-----------|
+| **V3-1a** ✅ | Schema + `journeys` CRUD + run creation on trigger (no scheduler) | **Verified 2026-07-29.** `make seed-journey` defines a 4-step journey, fires `signed_up`, then republishes the *identical* event (same `event_id`) straight to `campaigns.fanout`. Result: one run at `step_index=0 status=ready version=1`, and the redelivery logs `journey run duplicate` with the row count still 1. |
+| V3-1b | `journey-scheduler` + `delay` + `send` + send-gate | A two-step journey (`delay 60s` → `send`) delivers once, ~60 s later; killing the scheduler mid-step and restarting delivers exactly once total |
+| V3-1c | `branch_on_condition` + version pinning | A branch sends different templates by attribute; editing a journey mid-flight doesn't change in-flight runs |
+| V3-2 | Retry ladder + DLQ inspect/replay + alerts | A permanently-failing step lands in the DLQ after a bounded number of spaced attempts, and `make dlq-replay` drains it |
+| V3-3 | Per-workspace caps + fair claim | BM‑133's noisy-neighbour graph |
+| V3-x | Ceiling re-measure | BM‑140 |
 
 ---
 
@@ -458,6 +564,49 @@ inbound `event.Event`), `Attrs` (decoded `map[string]any` from
 `person.attributes`), and `Now` (UTC). Absent attributes render as
 `<no value>` rather than erroring (`missingkey=zero`).
 
+### HTTP — `track-api` `/journeys` (V3 design, not implemented)
+
+```
+POST /journeys
+Headers:
+  X-Workspace-ID: ws_alpha
+Body:
+  journey_id: string (required, [A-Za-z0-9_-]{1,64})
+  name:       string (required, ≤ 255 chars)
+  trigger:    condition tree (same grammar as segments/campaigns — BM-31)
+  steps:      array (required, ≤ 20; exactly three step types — BM-111)
+
+→ 201 Created    {"status":"ok","version":1}
+→ 400 Bad Request {"error":"steps[2]: branch target 1 must be > current index 2"}
+
+GET /journeys/{journey_id}          → definition + version + timestamps
+GET /journeys/{journey_id}/runs/{person_id}
+                                    → {step_index, status, wake_at, attempt}
+POST /journeys/{journey_id}/cancel  {person_id}   → cancels an in-flight run
+```
+
+A worked example — wait a day, then send different copy by plan:
+
+```json
+{
+  "journey_id": "onboard_pro",
+  "name": "Pro onboarding",
+  "trigger": {"op": "event_seen", "name": "signed_up"},
+  "steps": [
+    {"type": "delay",  "seconds": 86400},
+    {"type": "branch_on_condition",
+     "condition": {"op": "attr_eq", "key": "plan", "value": "pro"},
+     "if_true": 2, "if_false": 3},
+    {"type": "send", "template": "Your {{.Attrs.plan}} trial ends soon."},
+    {"type": "send", "template": "Upgrade to pro and get X."}
+  ]
+}
+```
+
+Branch targets are forward-only (BM‑111), so every run terminates. Steps
+execute in index order unless a branch jumps; falling off the end sets
+`status='done'`.
+
 ### HTTP — `stub-receiver`
 
 ```
@@ -556,7 +705,7 @@ bottleneck-migration narrative with hardware-pinned numbers.
 | V2-2 | Roaring bitmaps (`segment-worker` serves `/check`) + campaign/attribute caches remove the per-event MySQL reads from the fan-out hot path | Worker stops being the constraint: backlog **9,134 → 83**, worker CPU 224% → 145%. Intake flat at **~2,700/s** under doubled concurrency | **Shared single MySQL write throughput** — one event `INSERT` + one enrollment `INSERT` per event, MySQL pinned ~306% while worker (145%) and track-api (130%) have headroom |
 | V2-2x | MySQL pool default 25 → 50 (PR 12) | Intake **2,173 → 2,836/s**, p99 **306 → 197 ms** going 25 → 64 conns | Still MySQL writes — the pool was throttling *access* to the bottleneck, not the bottleneck itself |
 | V2-3 | Batched idempotent enrollment (multi-row commit per flush + UNIQUE natural key) | Write side keeps pace: peak backlog **166** batched vs **156,961** unbatched; ~63.5 rows/flush; 0 duplicate enrollments across 700k+ rows | Still the shared MySQL, now on the event-`INSERT` (intake) side — the fan-out write is amortized. Next levers: read/write split, or shard (V3/V4) |
-| V3 | Journey FSM + DLQs + per-workspace queue isolation | *(not built)* | V4 sharding |
+| V3 | Journey FSM (persisted runs + `SKIP LOCKED` scheduler) + retry ladder/DLQ + per-workspace capacity caps | *(designed, not built)* — **predicted: 3–5× LOWER than V2**, ~10 writes per enrolled person vs 2 | Predicted: still MySQL writes, mix shifted from intake to FSM state transitions. **This is the one tier that trades throughput for correctness rather than raising the ceiling** (§3.3) |
 
 ---
 
@@ -572,7 +721,7 @@ bottleneck-migration narrative with hardware-pinned numbers.
 | Q6 | Multi-tenancy — its own tier or cross-cutting? | **Cross-cutting from V1.** `workspace_id` on every row, queue key, and span attribute. Otherwise V3 becomes a rewrite, not a delta. |
 | Q7 | Scale targets — absolute numbers or bottleneck narratives? | **Bottleneck-migration narratives** with hardware specs at the top of each tier's writeup. "V1 ceiling = single-writer MySQL contention at ~N writes/sec on this box; V2 changes Y, new ceiling is Z" reads honest. Fabricated laptop numbers read as fabricated to a Customer.io reviewer. |
 | Q8 | V1 service boundary — one binary or many? | **Two binaries**: `track-api` + `stub-receiver`. Anything beyond a stub receiver lives behind the in-process channel; spinning out a `campaign-worker` binary is a V1.1 PR if needed. |
-| Q9 | Journey FSM — V3 or V4? | **V3 implementation if interview timeline allows; V3 design-doc-only otherwise.** Capped at three step types: `send`, `delay`, `branch_on_condition`. Persisted rows in MySQL; single scheduler worker polling `WHERE wake_at <= NOW() FOR UPDATE SKIP LOCKED`. |
+| Q9 | Journey FSM — V3 or V4? | **V3, design-doc-only — written up in §3.3 (0.3.0-draft), unimplemented.** Three step types as capped: `send`, `delay`, `branch_on_condition`. Persisted runs in MySQL, claimed with `FOR UPDATE SKIP LOCKED`. Two refinements the design forced: the scheduler sleeps until `MIN(wake_at)` rather than polling a fixed tick (it shares the write bottleneck it adds to), and it is **not** single-process by necessity — `SKIP LOCKED` makes N replicas safe, so single-process is a default, not a constraint. |
 | Q10 | V1 segment evaluation: scan, materialised view, or roaring bitmap? | **Scan-based** in V1 — for each `/check`, read the person row + `LIMIT 1000` recent events, evaluate the condition tree in-process. Roaring bitmaps with incremental membership maintenance arrive in V2 (`customerio/roaring`-style). The V1 ceiling is the read-amplification of "scan events on every check"; the V2 mechanism removes it. Same `Condition` API survives the swap. |
 | Q11 | What does the V1 segment grammar cover? | **Six ops:** `and`/`or`/`not` boolean; `attr_eq`/`attr_exists` over `person.attributes`; `event_seen` over the person's full event history in the workspace. Time-window predicates (`event_seen_within_30d`), count thresholds (`event_count > N`), arithmetic comparisons (`gt`/`lt`) — all out of V1; V1.x or V2. |
 
@@ -582,9 +731,13 @@ bottleneck-migration narrative with hardware-pinned numbers.
 
 | # | Question | State |
 |---|----------|-------|
-| Q12 | Where does the two-phase send-gate belong (BM‑105)? | **Deferred out of V2-3, open for V3.** On a stub sink with a write-bound MySQL it adds two writes per dispatch for no observable payoff — the measurement said the write side was already the constraint. It only earns its cost against a real sender that can double-charge, and its natural partner is V3-2's retry/DLQ semantics (a send-gate without bounded retry just moves the failure). Decide when a real ESP replaces `stub-receiver`. |
-| Q13 | How is a poison message bounded before V3-2? | **Open.** Requeue is currently unbounded (BM‑85 defers retry semantics). `messaging.consume.requeued{queue,redelivered}` makes a spin visible, but nothing stops it. Candidates: a `x-delivery-count` header maintained by the worker; RabbitMQ quorum queues with `delivery-limit` (also gets DLQ routing for free); or an app-side attempt counter in the message body. Quorum queues look cheapest and move the mechanism into the broker, which is where V2-1's design instinct already put backlog. |
+| Q12 | Where does the two-phase send-gate belong (BM‑105)? | **Resolved by the V3 design: it becomes required in V3-1, as BM‑118.** The V2-3 deferral reasoning was sound but time-limited — against a stub sink, double-sending costs nothing. A leased FSM changes that: reclaiming an expired lease makes a repeat `send` reachable in *normal* operation, not just after a crash, so the gate stops being defensive and becomes load-bearing. Keyed deterministically on `run_id:step_index` rather than the original `person:campaign:schedule_key`, which the FSM makes both simpler and exact. |
+| Q13 | How is a poison message bounded? | **Resolved by the V3-2 design: a TTL-ladder of retry queues plus a header attempt cap (BM‑120/121), not quorum-queue `delivery-limit`.** I changed my mind while writing it up. `delivery-limit` bounds attempts and dead-letters for free, which is genuinely attractive — but it can only redeliver *immediately*, and every failure mode worth retrying here (MySQL connection blip, stub timeout, broker hiccup) needs the retry *spaced*, not instant. Immediate redelivery burns the attempt budget inside the outage window and dead-letters a message that a 30-second wait would have delivered. The ladder costs four extra queue declarations and gets both properties. Quorum queues remain worth adopting for replication, which is a different argument. |
 | Q14 | Does the eventual-consistency window on attributes need bounding? | **Open, low priority.** V2-2c trades per-event `person.Get` for an in-process cache fed by `people.changes`; an event arriving just after an attribute change can evaluate the pre-change value. Cache-miss falls back to MySQL so a *new* person is never missed — only a *recently changed* value is briefly stale. Unmeasured: how wide the window actually is under load. Worth a number before claiming it's negligible. |
+| Q15 | Re-entry: one run per (person, journey), or concurrent runs? | **Open — the design assumes one, via BM‑113's UNIQUE key on `(workspace_id, journey_id, triggered_by)`.** Note that key permits re-entry on a *different* triggering event, which is probably right for "abandoned cart" (each abandonment is its own journey) and wrong for "onboarding" (one per person, ever). The real answer is a per-journey `re_entry: once \| per_trigger` policy, which is a fourth concept and so deliberately out of the V3 cap. Pick per-trigger for V3 and note the limitation. |
+| Q16 | Does a stuck `sending` key retry or fail? | **Open, and it is the honest hard one (BM‑118).** A key stuck in `sending` means the process died between the gate and the POST — there is no way to know whether the downstream received it. Retrying risks a double-send; failing risks a silent non-send. Neither is safe, so it must be a documented per-workspace choice, and the answer differs by message class: a password reset should retry, a $500 invoice should fail and alert. Any spec that claims to resolve this without a real sender in the loop is bluffing. |
+| Q17 | Where does run state ultimately belong? | **Open, V4 territory.** `journey_runs` is a high-churn table — every step is an `UPDATE` to a row with a hot secondary index on `(status, wake_at)`, which is close to a worst case for InnoDB. If BM‑140 confirms FSM transitions dominate the write mix, the lever is not tuning the table: it is sharding by `workspace_id`, or moving run state somewhere designed for churn and time-ordered wakeups. Worth naming as a V4 question rather than pretending MySQL is the end state. |
+| Q18 | How does a person *leave* a journey? | **Open, minimal in V3.** The design has `status='cancelled'` but no automatic exit — a person who stops matching the trigger, or unsubscribes, keeps advancing. Real products need a global suppression list checked at every `send`. That is a fourth mechanism, so V3 ships explicit cancellation only, and the gap is stated rather than hidden. |
 
 ---
 
@@ -592,6 +745,8 @@ bottleneck-migration narrative with hardware-pinned numbers.
 
 | Version | Date       | Author        | Notes |
 |---------|------------|---------------|-------|
+| 0.3.1   | 2026-07-29 | Steve Weiland | **V3-1a built** (BM‑110..114): `migrations/005_journeys.sql` (`journeys` + `journey_runs` with the lease columns V3-1b will claim on), `internal/journey` (step validation, `Compile`, store, TTL `Cache`, `Enroller`), `POST/GET /journeys` + `GET /journeys/{id}/runs/{person_id}`, and enrollment wired into the campaign-worker's per-event path. 15 tests. **Verified end-to-end** via `make seed-journey`, including a genuine redelivery (the identical `event_id` republished to the exchange): one run created, redelivery logged as `duplicate`, row count still 1 — BM‑113 holds against the real consumer, not just in a unit test. **Two bugs found by running it.** (1) `Processor.Process` returned early on `len(campaigns) == 0`, so journey enrollment was silently skipped in any workspace with journeys but no campaigns — which is exactly the state a fresh V3 install is in. The guard now requires both paths idle. (2) A duplicate `journey_id` returned 500; it's a client error, so `Create` maps MySQL 1062 to `ErrConflict` → 409. Design notes carried into code: the journey list is cached per workspace from the start (a per-event `ListByWorkspace` would reintroduce the V2-1 bottleneck the design forbids in §3.3 rule 1), and the enroller is reached through an interface declared in `internal/campaign` because `journey` already imports `campaign` for `ParseTemplate` — the interface is what keeps that from being an import cycle. |
+| 0.3.0-draft | 2026-07-28 | Steve Weiland | **V3 designed, not implemented** (Q9 permits design-doc-only). §3.3 written out as three mechanism slices with BM‑110..140: persisted journey FSM (`journeys` + `journey_runs`, three step types, version pinning, `FOR UPDATE SKIP LOCKED` claim with leases), retry ladder + operable DLQ, per-workspace capacity caps. §4 gains the `/journeys` surface, §2 gains Journey / Journey run / Lease, §6's V3 row gains a prediction, §3.3.5 lists the PR sequence. **The headline of this tier is that it does not raise the ceiling — it spends throughput to buy correctness**: ~10 writes per enrolled person vs V2's 2, so a predicted 3–5× throughput *reduction*, stated up front so BM‑140's numbers don't read as a regression. Two structural rules fall out and are recorded as such: the FSM must stay off the per-event fan-out path (or V2's measurements are invalidated), and the scheduler must sleep to `MIN(wake_at)` rather than poll a fixed tick (it shares the write bottleneck it adds to). **Q12 resolved** — the two-phase send-gate is promoted from deferred to required (BM‑118), because a leased FSM makes a repeat send reachable in normal operation, not only after a crash; keyed `run_id:step_index`. **Q13 resolved, and I changed my mind while writing it:** the TTL retry ladder beats quorum-queue `delivery-limit`, because `delivery-limit` can only redeliver immediately and every retryable failure here needs spacing — instant redelivery burns the attempt budget inside the outage it is retrying. New **Q15–Q18** record what the design deliberately does not settle: journey re-entry policy, whether a stuck `sending` key retries or fails (unanswerable without a real sender — password reset and invoice want opposite answers), where high-churn run state belongs long-term, and journey exit/suppression. |
 | 0.2.8   | 2026-07-28 | Steve Weiland | Silence the mysqlreceiver replica-status noise. This build is deliberately single-node, so the replica metrics are disabled in `deploy/otel-collector.yaml` (`mysql.replica.sql_delay`, `mysql.replica.time_behind_source`). **Disabling them is not sufficient:** mysqlreceiver runs `SHOW REPLICA STATUS` on every scrape regardless of whether those metrics are enabled — verified, the "Error 1227 Access denied" line kept appearing 4×/min after the metrics were off — so `migrations/001` also grants `REPLICATION CLIENT` (read-only metadata access) to make the probe return zero rows quietly. The grant is commented at length because a replication privilege on a replica-less stack otherwise reads as a mistake. Verified: zero replica-status lines across ~5 scrape intervals, 239 `mysql_*` series still exported. Note the grant is in an initdb migration, so it applies on a fresh datadir only — an existing volume needs it applied by hand (same caveat as BM‑100's ALTER). |
 | 0.2.7   | 2026-07-28 | Steve Weiland | Wires `otelsql` (XSAM/otelsql v0.42.0 — pinned to the release that keeps the OTel SDK at 1.43.0 rather than dragging it to 1.44.0), closing the last item that had been "a small follow-up commit" since V1 kickoff and completing **BM‑42**. A `POST /events` trace now carries its MySQL hops: person ensure + event INSERT under `track-api.http`, campaign/attribute reads under `campaign.process` on cache miss. Span noise trimmed to one span per statement — otelsql otherwise emits `sql.conn.exec` *and* `sql.stmt.exec` for the same INSERT (go-sql-driver returns `ErrSkip` for a parameterized exec, so database/sql falls back to prepare+exec and the conn-level span describes a call that never ran), plus a `sql.rows` span per result set; `OmitConnQuery` doesn't cover exec, so a `SpanFilter` drops `MethodConnExec`. `RegisterDBStatsMetrics` adds pool utilization (`db_client_connections_*`) — the V2-2x finding that requests queued on the pool *in front of* MySQL was inferred, and is now directly measurable. **The batched enrollment INSERT needed span links, not a parent:** a flush commits rows from N traces, so `Batcher` captures each submitter's span context and the flush emits `campaign.enroll_flush` (attribute `enroll.batch_rows`) linked to all of them, with the INSERT nested beneath. Verified end-to-end against a live stack: link target decoded and matched the originating dispatch trace exactly. |
 | 0.2.6   | 2026-07-28 | Steve Weiland | Close-out review of V1 + V2 (no new tier). **Unmet MUSTs closed:** BM‑82/86 — per-workspace queue depth was specified but never observable; RabbitMQ is now scraped at `/metrics/detailed` with `workspace_id` relabeled out of the queue name (excluding the global DLQ and the `segments.index.people` feed, which would otherwise appear as phantom workspaces). BM‑86 amended: the app-emitted `campaign_queue_depth` gauge it specified was the wrong design — the broker owns the depth. BM‑103 — `CAMPAIGN_BATCH`/`BATCH_MAX`/`BATCH_WINDOW` now plumbed through compose, so the batching A/B is reproducible without editing it. BM‑52 — `make load` alias added. BM‑42 — trace shape updated to the V2-1b reality (via the broker; MySQL spans still absent, `otelsql` still unwired). **Bug found + fixed:** `Publisher.Submit` folded the shutdown check into the same `select` as the buffer send, so with both cases ready Go's uniform-random choice enqueued ~half of post-`Stop()` events into a buffer nothing drains — counted as neither drop reason. Silent loss is the exact V1 bug V2 replaced; shutdown now gets deterministic precedence. Surfaced by writing the first `Publisher` test. **Hot path:** trigger JSON decode + `text/template` parse were running per event; `Campaign.Compile()` hoists both to once per cache refresh (the `CAMPAIGN_HOT_PATH=mysql` baseline still recompiles per event, deliberately). **Observability:** `messaging.consume.requeued{queue,redelivered}` — requeue is unbounded until V3-2, so a poison message spinning was previously invisible behind an empty DLQ. **Spec hygiene:** duplicate `BM‑30/31/32` (segment store vs stub receiver) renumbered to `BM‑43..45`; §3.1.4 → §3.1.4d; §5 out-of-scope reconciled with what shipped; §6 tier table filled for V2-2/V2-2x/V2-3 and the "render CPU / bitmap memory" guess replaced with the measured answer (shared-MySQL writes) in §1 and §6; §4 environment completed; §8 gains Q12–Q14 (send-gate placement, poison-message bounding, attribute staleness window); revision history reordered newest-first. |

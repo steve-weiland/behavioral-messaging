@@ -3,7 +3,7 @@
 COMPOSE ?= docker compose
 
 .PHONY: help up down logs ps rebuild test fmt vet seed seed-people seed-segments seed-campaign showcase \
-	load load-prep load-quick load-soak \
+	load load-prep load-quick load-soak seed-journey journey-runs \
 	mysql events-count people-count segments-count campaigns-count enrollments-count
 
 help:
@@ -73,6 +73,36 @@ seed-people: ## Identify p_alice with a small attribute set, then read back (V1 
 		http://localhost:8090/people && echo
 	@echo "--- final state of p_alice ---"
 	@curl -fsS -H 'X-Workspace-ID: ws_alpha' http://localhost:8090/people/p_alice
+
+seed-journey: ## V3-1a: define a journey, fire a trigger, then REDELIVER it — expect exactly 1 run
+	@echo "1. ensure onboard_pro exists (delay 60s -> branch on plan -> send):"
+	@if ! curl -fsS -H 'X-Workspace-ID: ws_alpha' http://localhost:8090/journeys/onboard_pro >/dev/null 2>&1; then \
+	  curl -fsS -X POST http://localhost:8090/journeys \
+	    -H "X-Workspace-ID: ws_alpha" -H "Content-Type: application/json" \
+	    -d '{"journey_id":"onboard_pro","name":"Pro onboarding","trigger":{"op":"event_seen","name":"signed_up"},"steps":[{"type":"delay","seconds":60},{"type":"branch_on_condition","condition":{"op":"attr_eq","key":"plan","value":"pro"},"if_true":2,"if_false":3},{"type":"send","template":"Your {{.Attrs.plan}} trial ends soon."},{"type":"send","template":"Upgrade to pro."}]}' && echo "   created"; \
+	else echo "   already exists"; fi
+	@echo "2. identify pj_alice (plan=pro):"
+	@curl -fsS -X POST http://localhost:8090/people \
+	  -H "X-Workspace-ID: ws_alpha" -H "Content-Type: application/json" \
+	  -d '{"person_id":"pj_alice","attributes":{"plan":"pro"}}' && echo
+	@echo "3. fire signed_up (creates the run):"
+	@EV=$$(curl -fsS -X POST http://localhost:8090/events \
+	  -H "X-Workspace-ID: ws_alpha" -H "Content-Type: application/json" \
+	  -d '{"person_id":"pj_alice","event_name":"signed_up","payload":{}}' | python3 -c "import sys,json;print(json.load(sys.stdin)['event_id'])"); \
+	  echo "   event_id=$$EV"; sleep 4; \
+	  echo "4. run after first delivery:"; \
+	  curl -fsS -H "X-Workspace-ID: ws_alpha" http://localhost:8090/journeys/onboard_pro/runs/pj_alice | python3 -m json.tool; \
+	  echo "5. REDELIVER the identical event (same event_id) straight to the exchange:"; \
+	  curl -fsS -u guest:guest -H "Content-Type: application/json" \
+	    -X POST http://localhost:15672/api/exchanges/%2f/campaigns.fanout/publish \
+	    -d "$$(python3 -c 'import json,sys; ev={"workspace_id":"ws_alpha","event_id":sys.argv[1],"person_id":"pj_alice","event_name":"signed_up","payload":{},"received_at":"2026-07-29T00:00:00Z"}; print(json.dumps({"properties":{"delivery_mode":2},"routing_key":"ws_alpha","payload":json.dumps(ev),"payload_encoding":"string"}))' "$$EV")" && echo; \
+	  sleep 4
+	@echo "6. run count for onboard_pro (BM-113 — expect exactly 1):"
+	@$(MAKE) -s journey-runs
+
+journey-runs: ## Count + show journey_runs rows
+	@$(COMPOSE) exec -T mysql mysql -ubm -pbm bm -e \
+	  "SELECT journey_id, person_id, step_index, status, journey_version, COUNT(*) OVER () AS total_rows FROM journey_runs ORDER BY created_at DESC LIMIT 10;" 2>/dev/null
 
 mysql: ## Interactive mysql shell against the bm database
 	$(COMPOSE) exec mysql mysql -ubm -pbm bm

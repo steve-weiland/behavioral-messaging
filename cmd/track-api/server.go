@@ -18,6 +18,7 @@ import (
 	"github.com/steveweiland/behavioral-messaging/internal/campaign"
 	"github.com/steveweiland/behavioral-messaging/internal/event"
 	"github.com/steveweiland/behavioral-messaging/internal/eventstore"
+	"github.com/steveweiland/behavioral-messaging/internal/journey"
 	"github.com/steveweiland/behavioral-messaging/internal/peoplefeed"
 	"github.com/steveweiland/behavioral-messaging/internal/person"
 	"github.com/steveweiland/behavioral-messaging/internal/segment"
@@ -34,6 +35,9 @@ const (
 	segmentScanEventLimit = 1000
 	maxCampaignBodyBytes  = 32 * 1024
 	maxTemplateBytes      = 16 * 1024
+	// A journey holds up to MaxSteps steps, each of which may carry a
+	// template, so its body cap is larger than a single campaign's.
+	maxJourneyBodyBytes = 128 * 1024
 )
 
 type intakeRequest struct {
@@ -62,6 +66,13 @@ type segmentCheckResponse struct {
 	SegmentID   string `json:"segment_id"`
 	PersonID    string `json:"person_id"`
 	Member      bool   `json:"member"`
+}
+
+type defineJourneyRequest struct {
+	JourneyID string          `json:"journey_id"`
+	Name      string          `json:"name"`
+	Trigger   json.RawMessage `json:"trigger"`
+	Steps     []journey.Step  `json:"steps"`
 }
 
 type defineCampaignRequest struct {
@@ -106,6 +117,8 @@ func (s *server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("/segments/", s.handleSegmentsGet)
 	mux.HandleFunc("/campaigns", s.handleCampaignsPost)
 	mux.HandleFunc("/campaigns/", s.handleCampaignsGet)
+	mux.HandleFunc("/journeys", s.handleJourneysPost)
+	mux.HandleFunc("/journeys/", s.handleJourneysGet)
 	mux.HandleFunc("/events", s.handleEventsPost)
 }
 
@@ -710,4 +723,148 @@ func isJSONObject(b []byte) bool {
 		return c == '{'
 	}
 	return false
+}
+
+// ----- V3-1a journeys -------------------------------------------------
+
+// handleJourneysPost defines a journey (BM-110). Validation is strict and at
+// insert time: a definition that reaches the scheduler is one the scheduler
+// can execute, so a bad step shape fails here rather than three days into a
+// delay.
+func (s *server) handleJourneysPost(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	workspace := r.Header.Get("X-Workspace-ID")
+	if !validShortID(workspace) {
+		writeErr(w, http.StatusBadRequest, "X-Workspace-ID required ([A-Za-z0-9_-]{1,64})")
+		return
+	}
+	body, err := readBody(r, maxJourneyBodyBytes)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var req defineJourneyRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if !validShortID(req.JourneyID) {
+		writeErr(w, http.StatusBadRequest, "journey_id required ([A-Za-z0-9_-]{1,64})")
+		return
+	}
+	if req.Name == "" || len(req.Name) > 255 {
+		writeErr(w, http.StatusBadRequest, "name required, ≤ 255 chars")
+		return
+	}
+	if len(req.Trigger) == 0 {
+		writeErr(w, http.StatusBadRequest, "trigger required")
+		return
+	}
+	cond, err := segment.DecodeCondition(req.Trigger)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "trigger: "+err.Error())
+		return
+	}
+	if err := cond.Validate(); err != nil {
+		writeErr(w, http.StatusBadRequest, "trigger: "+err.Error())
+		return
+	}
+	if err := journey.ValidateSteps(req.Steps); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	j := journey.Journey{
+		WorkspaceID: workspace,
+		JourneyID:   req.JourneyID,
+		Name:        req.Name,
+		Trigger:     req.Trigger,
+		Steps:       req.Steps,
+	}
+	if err := journey.Create(r.Context(), s.db, j); errors.Is(err, journey.ErrConflict) {
+		writeErr(w, http.StatusConflict, "journey_id already exists")
+		return
+	} else if err != nil {
+		slog.ErrorContext(r.Context(), "journey create failed",
+			slog.String("workspace_id", workspace),
+			slog.String("journey_id", req.JourneyID),
+			slog.Any("error", err))
+		writeErr(w, http.StatusInternalServerError, "store failed")
+		return
+	}
+	slog.InfoContext(r.Context(), "journey created",
+		slog.String("workspace_id", workspace),
+		slog.String("journey_id", req.JourneyID),
+		slog.String("name", req.Name),
+		slog.Int("steps", len(req.Steps)))
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_, _ = w.Write([]byte(`{"status":"ok","version":1}`))
+}
+
+// handleJourneysGet serves both
+//
+//	GET /journeys/{journey_id}
+//	GET /journeys/{journey_id}/runs/{person_id}
+//
+// The run read is what makes the V3-1a milestone checkable without opening a
+// MySQL shell: it shows the step index and status the scheduler will act on.
+func (s *server) handleJourneysGet(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	workspace := r.Header.Get("X-Workspace-ID")
+	if !validShortID(workspace) {
+		writeErr(w, http.StatusBadRequest, "X-Workspace-ID required ([A-Za-z0-9_-]{1,64})")
+		return
+	}
+	rest := strings.TrimPrefix(r.URL.Path, "/journeys/")
+	parts := strings.Split(rest, "/")
+	journeyID := parts[0]
+	if !validShortID(journeyID) {
+		writeErr(w, http.StatusBadRequest, "journey_id required in path")
+		return
+	}
+
+	// /journeys/{id}/runs/{person_id}
+	if len(parts) == 3 && parts[1] == "runs" {
+		personID := parts[2]
+		if personID == "" || len(personID) > 128 {
+			writeErr(w, http.StatusBadRequest, "person_id required in path")
+			return
+		}
+		run, err := journey.GetRunByPerson(r.Context(), s.db, workspace, journeyID, personID)
+		if errors.Is(err, journey.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "no run for this person")
+			return
+		}
+		if err != nil {
+			slog.ErrorContext(r.Context(), "journey run read failed", slog.Any("error", err))
+			writeErr(w, http.StatusInternalServerError, "read failed")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(run)
+		return
+	}
+	if len(parts) != 1 {
+		writeErr(w, http.StatusNotFound, "not found")
+		return
+	}
+
+	j, err := journey.Get(r.Context(), s.db, workspace, journeyID)
+	if errors.Is(err, journey.ErrNotFound) {
+		writeErr(w, http.StatusNotFound, "not found")
+		return
+	}
+	if err != nil {
+		slog.ErrorContext(r.Context(), "journey read failed", slog.Any("error", err))
+		writeErr(w, http.StatusInternalServerError, "read failed")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(j)
 }

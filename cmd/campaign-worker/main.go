@@ -46,6 +46,7 @@ import (
 	"github.com/steveweiland/behavioral-messaging/internal/campaign"
 	"github.com/steveweiland/behavioral-messaging/internal/event"
 	"github.com/steveweiland/behavioral-messaging/internal/eventstore"
+	"github.com/steveweiland/behavioral-messaging/internal/journey"
 	"github.com/steveweiland/behavioral-messaging/internal/logsx"
 	"github.com/steveweiland/behavioral-messaging/internal/otelinit"
 	"github.com/steveweiland/behavioral-messaging/internal/peoplefeed"
@@ -155,7 +156,28 @@ func main() {
 		slog.Info("enrollment batching disabled (direct inserts)")
 	}
 
+	// V3-1a journey enrollment. This is the ONLY journey work on the
+	// per-event path: evaluate triggers against the cached journey list and
+	// write one run row per match. Step execution belongs to the scheduler
+	// (V3-1b) — the design's first structural rule is that the FSM stays off
+	// the fan-out path, or V2's measurements stop meaning anything.
+	// JOURNEYS=off skips it entirely, keeping the V2 path available as the
+	// A/B baseline for BM-140's before/after.
+	var enroller *journey.Enroller
+	if envOr("JOURNEYS", "on") != "off" {
+		jCache := journey.NewCache(db, envDuration("JOURNEY_CACHE_TTL", 5*time.Second))
+		enroller = journey.NewEnroller(db, jCache)
+		slog.Info("journey enrollment enabled")
+	} else {
+		slog.Info("journey enrollment disabled")
+	}
+
 	processor := campaign.NewProcessorWithCaches(db, httpClient, stubURL, attrCache, campCache, batcher)
+	if enroller != nil {
+		// Guarded: passing a nil *journey.Enroller through the interface
+		// would make it non-nil and panic on first use.
+		processor.SetEnroller(enroller)
+	}
 
 	workspaces, err := listWorkspaces(rootCtx, db)
 	if err != nil {

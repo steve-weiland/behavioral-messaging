@@ -46,7 +46,26 @@ type Processor struct {
 	// commit each); when set, they coalesce into batched commits. Either
 	// way the insert is idempotent (uniq_enrollment_dispatch).
 	batcher *Batcher
+
+	// V3-1a journey enrollment. Nil disables it (JOURNEYS=off).
+	enroller Enroller
 }
+
+// Enroller creates journey runs for an inbound event (V3-1a).
+//
+// Declared as an interface here rather than importing internal/journey,
+// because journey already imports this package for ParseTemplate — the
+// interface is what keeps that from being an import cycle. Same seam pattern
+// as execFunc and the traffic-api speedSource: the consumer declares the
+// narrow contract it needs.
+type Enroller interface {
+	Enroll(ctx context.Context, per *person.Person, ev event.Event) error
+}
+
+// SetEnroller attaches journey enrollment. Callers MUST NOT pass a typed nil
+// pointer — check for nil at the call site — since a non-nil interface holding
+// a nil pointer would defeat the nil check in Process.
+func (p *Processor) SetEnroller(e Enroller) { p.enroller = e }
 
 // NewProcessor wires the deps with the direct-MySQL hot path (no caches,
 // no batcher).
@@ -139,10 +158,16 @@ func (p *Processor) Process(parent context.Context, ev event.Event) amqpx.Outcom
 		span.RecordError(err)
 		return amqpx.OutcomeNackRequeue
 	}
-	if len(campaigns) == 0 {
+	// Nothing to do only when BOTH paths are idle. Gating on campaigns alone
+	// would silently skip journey enrollment in any workspace that has
+	// journeys but no campaigns — which is exactly the state a fresh V3
+	// install is in.
+	if len(campaigns) == 0 && p.enroller == nil {
 		return amqpx.OutcomeAck
 	}
 
+	// The person is needed by both paths: campaign triggers and journey
+	// triggers evaluate against the same attributes.
 	per, err := p.getPerson(ctx, ev.WorkspaceID, ev.PersonID)
 	if errors.Is(err, person.ErrNotFound) {
 		// EnsureExists on the producer side should make this near-
@@ -217,6 +242,22 @@ func (p *Processor) Process(parent context.Context, ev event.Event) amqpx.Outcom
 			slog.String("event_id", ev.EventID),
 			slog.String("enrollment_id", enrollID))
 	}
+	// V3-1a: enroll the journeys this event triggers. One row per match and
+	// nothing executed — the scheduler advances runs. A failure here is
+	// durable state we can't drop, so it requeues the event, which is safe
+	// because run creation is idempotent on
+	// (workspace_id, journey_id, triggered_by) (BM-113).
+	if p.enroller != nil {
+		if err := p.enroller.Enroll(ctx, per, ev); err != nil {
+			slog.ErrorContext(ctx, "journey enrollment failed — requeueing event",
+				slog.String("workspace_id", ev.WorkspaceID),
+				slog.String("event_id", ev.EventID),
+				slog.Any("error", err))
+			span.RecordError(err)
+			requeue = true
+		}
+	}
+
 	if requeue {
 		return amqpx.OutcomeNackRequeue
 	}

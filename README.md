@@ -15,7 +15,7 @@ changed, what now breaks" writeup with hardware-pinned measurements.
 | | |
 |--|--|
 | **Spec** | [`spec.md`](./spec.md) — RFC-2119 V1 + V2 + V3 requirements |
-| **Status** | **V1 + V2 complete** (spec 0.2.6). V3 is designed, not built. |
+| **Status** | **V1 + V2 complete**; V3 in progress — V3-1a (journeys + runs) built, scheduler next (spec 0.3.1). |
 | **Stack** | Go 1.25 · MySQL 8.0 · RabbitMQ 3.13 · OpenTelemetry SDK + Collector 0.151 · Tempo 2.10 · Prometheus 3.11 · Loki 3.7 · Grafana Alloy v1.16 · Grafana 13.0 · `docker compose` |
 
 **The tier story in four numbers.** Fan-out throughput **196/s → ~2,800/s**
@@ -41,7 +41,7 @@ a single shared MySQL's write throughput.
 |---|---|---|
 | **V1 Foundation** | Workspace-scoped from day 1. Single-process per service, single MySQL, in-process channel queue, scan-based segment eval, sync stub dispatch. | (baseline — sets the first ceiling) |
 | **V2 Throughput** | Roaring bitmaps for segments + RabbitMQ async fan-out + batched idempotent enrollment. | **Measured: shared single-MySQL write throughput.** Not render CPU or bitmap memory — those were the guesses going in, and neither is reached while one MySQL gates every event's two inserts. |
-| **V3 Durability** | Per-person journey state machine with delays (persisted FSM, SKIP-LOCKED scheduler) + DLQs + retry + per-workspace queue isolation. | Cross-workspace coordination overhead (V4 sharding territory). |
+| **V3 Durability** *(in progress — [spec §3.3](./spec.md#33-v3--durability))* | Persisted journey FSM (`SKIP LOCKED` claim + leases) + retry ladder with a DLQ that fills + per-workspace capacity caps. | **The one tier that lowers the ceiling on purpose** — ~10 writes per enrolled person vs V2's 2, so a predicted 3–5× throughput reduction bought in exchange for surviving a crash mid-journey. Predicted bottleneck: still MySQL writes, now dominated by FSM state transitions → V4 sharding. |
 
 Multi-tenancy is **not** a tier — it's a cross-cutting V1 property
 (`workspace_id` on every row, queue key, and span attribute).
@@ -53,6 +53,7 @@ make up            # docker compose up -d --build (12 services)
 make showcase      # every surface end-to-end: people → segment → campaign → events
 make seed          # POST 10 events at 1 req/s
 make seed-campaign # define welcome_pro + 2 people + fire signed_up — end-to-end smoke
+make seed-journey  # V3-1a: define a journey, fire a trigger, redeliver it — expect 1 run
 make load          # the ceiling-search run (= load-soak: 60s @ concurrency=20)
 make load-quick    # 10s burst @ concurrency=5 — sanity-check the driver
 make test          # go test ./...
@@ -500,7 +501,8 @@ or log shipping. Day-1 dashboards.
 | `v0.2.x-segments` | V2 PRs 9–11 | V2-2. PR 9: `internal/segmentidx` engine (9 tests). PR 10: `cmd/segment-worker/` + `/check` repoint + `people.changes` feed. PR 11: campaign-worker hot-path repoint — campaign + attribute caches replace the per-event MySQL reads. Re-measured: worker backlog 9,134 → 83, ceiling migrated to shared MySQL writes ([§ V2-2 ceiling](#v2-2-hot-path-ceiling-measured-2026-05-29)). **Next:** write-side (read/write split, batch enrollment inserts, or shard). |
 | `v0.2.x-idempotency` | V2 PR 13 | V2-3 (Lean): migration 004 unique `(workspace_id, campaign_id, triggered_by)` + `INSERT … ON DUPLICATE KEY UPDATE` → redelivery never double-enrolls; `internal/campaign/batcher.go` coalesces enrollment inserts (~63 rows/flush). Backlog 156,961 → 166; 0 dup enrollments across 700k+ rows. Two-phase send-gate deferred to V3. |
 | `v0.2.6-closeout` | Close-out review | Closed the specified-but-unbuilt per-workspace queue-depth metric (BM‑82/86 — RabbitMQ scrape with `workspace_id` relabeled from the queue name); made the batching A/B reachable from the host; hoisted the per-event trigger decode + template parse to once per cache refresh; added `messaging.consume.requeued` so an unbounded requeue is visible. **Fixed a silent-loss bug in `Publisher.Submit`** found by writing its first test — see [§ What broke](#what-broke-the-producers-shutdown-race). Spec: duplicate `BM‑30..32` renumbered, tier table filled, out-of-scope reconciled, Q12–Q14 recorded. |
-| `v0.3.0-durability` | V3 | Journey FSM · DLQs · retry-with-backoff + bounded requeue (Q13) · per-workspace queue isolation · two-phase send-gate (BM‑105) |
+| `v0.3.1-journeys` | V3-1a | `journeys` + `journey_runs` schema, `internal/journey`, `POST/GET /journeys`, and enrollment on the per-event path — one run row per trigger, idempotent under redelivery (BM‑113, verified with a real duplicate delivery). The journey list is cached per workspace from day one: a per-event `ListByWorkspace` would have reintroduced the exact V2-1 bottleneck V2-2c removed. No scheduler yet, so runs sit at `step_index=0` waiting for V3-1b. |
+| `v0.3.0-durability` | V3 — **designed** | Full design in [spec §3.3](./spec.md#33-v3--durability) (BM‑110..140) with a PR sequence. V3-1: `journeys` + `journey_runs`, three step types, version pinning, `SKIP LOCKED` claim + leases, and the send-gate promoted from deferred to required (a leased FSM makes a repeat send reachable in normal operation, not just after a crash). V3-2: TTL retry ladder + a DLQ with `inspect`/`replay`. V3-3: per-workspace in-flight caps + a noisy-neighbour graph as the artefact. Ceiling is predicted to go *down* — see the tier ladder. |
 
 ## Reading
 
