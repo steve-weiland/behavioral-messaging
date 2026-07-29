@@ -2,16 +2,16 @@
 
 | Field   | Value                                  |
 |---------|----------------------------------------|
-| Version | 0.3.8 (BM-140 measured; prediction wrong) |
+| Version | 0.3.9 (V3 complete; BM-140 re-measured)  |
 | Author  | Steve Weiland                          |
 | Date    | 2026-07-28                             |
-| Status  | V1 + V2 complete; V3 in progress (V3-2)  |
+| Status  | V1 + V2 + V3 complete                    |
 
 ---
 
 ## 1. Overview
 
-A multi-tenant behavioral messaging platform — Customer.io-inspired MVP
+A multi-tenant behavioral messaging platform — a product-shaped MVP
 sized to fit a laptop. Event-driven by design: a person performs an
 action (`signed_up`, `paid`, `clicked_link`), the platform stores the
 event, evaluates segment membership and campaign triggers, and dispatches
@@ -41,7 +41,7 @@ Multi-tenancy is **not** a tier — it's a cross-cutting V1 property
 | Workspace | Tenant boundary. All data is partitioned by `workspace_id`; no cross-workspace reads. |
 | Person | One tracked end-user. Identified by `(workspace_id, person_id)`. Attributes are a JSON column on the `people` table. |
 | Event | Append-only record of a behavioral action. PK `(workspace_id, event_id)`. Payload is JSON. |
-| Track API | HTTP intake — `POST /events` with `X-Workspace-ID` header. Mirrors Customer.io's terminology. |
+| Track API | HTTP intake — `POST /events` with `X-Workspace-ID` header. "Track" is the conventional name for this surface in behavioral-messaging products. |
 | Segment | Named set of persons matching a boolean condition tree over attributes + event history. V1 evaluates by scan; V2 by roaring bitmap with incremental membership maintenance. |
 | Campaign | A trigger condition + a message template. V1: single-step send on event match. V3: multi-step journey with delays + branches. |
 | Journey enrollment | The audit record when a campaign enrolls a person, with `event_id` cross-reference. |
@@ -175,8 +175,8 @@ for the run config and Grafana excerpts. Headline finding:
 - **Drop rate at the in-process channel:** ~69% during the soak.
 - **Named bottleneck:** the single Dispatcher consumer goroutine doing four serial MySQL hops + one sync HTTP per event.
 
-V2 closes that gap in three mechanism PRs, each one an interview answer
-with metrics from the same load driver re-run.
+V2 closes that gap in three mechanism PRs, each one a self-contained
+mechanism change with metrics from the same load driver re-run.
 
 #### 3.2.1 V2-1 — RabbitMQ async fan-out (BM‑80..89)
 
@@ -266,7 +266,7 @@ edges" are different claims.
 
 #### 3.2.2 V2-2 — Roaring bitmaps for segment evaluation (BM‑90..99)
 
-Maps to the interview question "Scale segment evaluation to 10M users."
+The canonical scaling question for this domain: evaluate segment membership for 10M users.
 Upstream `github.com/RoaringBitmap/roaring/v2`, not from-scratch
 primitives (Q4). Inverts V1's *compute-on-read* scan to
 *maintain-on-write* bitmaps.
@@ -378,8 +378,8 @@ Two structural rules follow, and both are load-bearing:
 #### 3.3.1 V3-1 — Persisted journey FSM (BM‑110..119)
 
 A journey is an ordered step list; a *run* is one person's position in it.
-Q9 caps step types at three, which is enough for the interview answer and
-small enough to finish: `send`, `delay`, `branch_on_condition`.
+Q9 caps step types at three — enough to be a real state machine, small
+enough to finish: `send`, `delay`, `branch_on_condition`.
 
 | ID | Requirement |
 |----|-------------|
@@ -441,7 +441,7 @@ The two real gaps:
 
 | ID | Requirement |
 |----|-------------|
-| `BM‑140` | **MEASURED 2026-07-29 on a fresh DB, and the §3.3 prediction was wrong in both directions.** Both arms: `ws_alpha`, 2 campaigns, single-`send` journey, loadgen c=100/30 s, identical conditions, tables truncated between arms. Baseline validity confirmed behaviourally (`journey_runs = 0` with `JOURNEYS=off`), not by log-grepping. <br><br>**Fan-out (worker) throughput:** V2 **861 events/s** → V3 **637 events/s** = a **1.35× reduction**, not 3–5×. Adding one run `INSERT` per event is cheap; the predicted write amplification barely showed up on this path. <br><br>**End-to-end (runs reaching `done`):** **42 runs/s** — the scheduler completed 2,450 of the 36,908 runs it was handed (6.6%). So V3's true ceiling is ~**20× below** V2's fan-out rate, far worse than predicted. <br><br>**The bottleneck is not MySQL writes.** It is the scheduler executing a claimed batch **sequentially** — `for i := range runs { s.executeRun(...) }`, one run at a time in a single goroutine, each doing a person read + gate `INSERT` + HTTP POST + gate `UPDATE` + advance `UPDATE`. ~24 ms per run serially ≈ the 42/s observed. The claim is batched and concurrent-safe; the *execution* is not. <br><br>**Named new bottleneck: scheduler step concurrency.** The fix is the lesson V2-1 already learned on the fan-out path — execute the claimed batch concurrently with a bounded worker pool — and it should be tried before any storage-level conclusion. §3.3's "predicted new bottleneck: MySQL writes dominated by FSM transitions" is **not supported**; MySQL was never reached. Q17 (where run state belongs) is therefore premature: the current design has not yet earned the right to blame the database. |
+| `BM‑140` | **Re-measured 2026-07-29, after fixing the bottleneck the first measurement found.** Both arms on a fresh DB, `ws_alpha`, 2 campaigns, single-`send` journey, loadgen c=100/30 s; baseline validity confirmed behaviourally (`journey_runs = 0`). V2: **956 events/s** fan-out. V3: **762 events/s** fan-out and **503 runs/s** end-to-end. **The prediction was a 3–5× reduction; measured 1.9× end-to-end** (956 → 503) and 1.25× on fan-out — the durability tier costs materially less than the spec feared. The first measurement's 42 runs/s (~20×) was **not** the architecture: it was a scheduler executing each claimed batch sequentially. Bounded concurrency over the batch took it **42 → 503 runs/s, a 12× improvement**, and parallelizing was always safe because each run is a distinct row already leased to this replica. Note 27,664 of 41,870 runs had completed when the window closed, so **503/s is a floor, not a ceiling**. **Named new bottleneck: still not established** — neither arm was driven to saturation after the fix, and MySQL was never shown to be the constraint, so Q17 (where run state belongs) remains premature. |
 
 #### 3.3.5 V3 milestones
 
@@ -449,7 +449,7 @@ The two real gaps:
 |---|----|-----------|
 | **V3-1a** ✅ | Schema + `journeys` CRUD + run creation on trigger (no scheduler) | **Verified 2026-07-29.** `make seed-journey` defines a 4-step journey, fires `signed_up`, then republishes the *identical* event (same `event_id`) straight to `campaigns.fanout`. Result: one run at `step_index=0 status=ready version=1`, and the redelivery logs `journey run duplicate` with the row count still 1. |
 | **V3-1b** ✅ | `journey-scheduler` + all three step types + leases + send-gate | **Verified 2026-07-29.** `delay 10s → branch → send` ran to `done` with exactly one delivery and one `idempotency_keys` row. Exactly-once tested two ways: (a) the crash-after-POST shape (run left `running` at the send step with an expired lease, gate row already `sent`) → reclaimed, gate logged `send already completed — skipping`, deliveries unchanged; (b) a real `docker kill` of the scheduler mid-journey → restart completed the run, deliveries **+1 exactly**. Branch execution was pulled forward from 1c: shipping a scheduler that fails on a step type the API accepts is a worse state than redrawing the milestone line. |
-| V3-1c | Version-pinning **enforcement** + journey update endpoint | `PUT /journeys/{id}` bumps the version and stores the definition per version; a run mid-flight keeps executing the definition it enrolled on. Today the run *records* `journey_version` (BM-114) and the scheduler warns on a mismatch, but only the latest definition is stored, so pinning isn't enforced yet. (Branch execution shipped in 1b.) |
+| **V3-1c** ✅ | Version-pinning **enforcement** + journey update endpoint | `PUT /journeys/{id}` bumps the version and stores the definition per version; a run mid-flight keeps executing the definition it enrolled on. **Verified 2026-07-29.** `migrations/006` adds `journey_versions` (append-only; a `(journey, version)` pair never changes meaning, so it is cached forever). `PUT /journeys/{id}` bumps the version and snapshots the definition in one transaction. The scheduler resolves the **pinned** version rather than the current one. Test: a run enrolled on v1 mid-`delay`, v2 was published underneath it, and the run finished on **v1** while the journey sat at **v2**. (Branch execution shipped in 1b.) |
 | **V3-2** ✅ | Retry ladder + operable DLQ + alerts | **Verified 2026-07-29** by stopping MySQL to create a real transient failure. `x-attempt=0` → landed on the **5s rung**; when it returned and MySQL was still down it climbed to the **30s rung**; once MySQL was back the real problem surfaced (no such person) and it dead-lettered as `cause=terminal` — the classification working in both directions. A message pre-set to `x-attempt=4` dead-lettered immediately as `cause=exhausted`, carrying our own reason header. Then the full operator loop: `make dlq-inspect` showed both causes and reasons, the cause was fixed (missing people created), `make dlq-replay` drained 2 → **0**, and the DLQ **stayed** 0 because the replayed messages completed — both persons enrolled and progressed to step 1. |
 | V3-3 | Per-workspace caps + fair claim | BM‑133's noisy-neighbour graph |
 | V3-x | Ceiling re-measure | BM‑140 |
@@ -725,16 +725,16 @@ bottleneck-migration narrative with hardware-pinned numbers.
 
 | # | Question | Resolution |
 |---|---|---|
-| Q1 | Which RDBMS? | **MySQL 8.0.latest** — Customer.io stack alignment + fills the CV gap explicitly called out in the role evaluation. Postgres depth from prior builds transfers. |
-| Q2 | Postgres or MySQL JSON columns? | **MySQL `JSON` type** with no schema enforcement on attributes/payload. Trade-off: no per-attribute index from day one (Customer.io's actual production answer is a per-workspace attribute index — V4). |
+| Q1 | Which RDBMS? | **MySQL 8.0.latest** — deliberately the less-familiar engine. Prior builds in this series used Postgres, so that knowledge was already banked; the gap worth closing was MySQL's (JSON without `jsonb`, `ON DUPLICATE KEY UPDATE`, and `FOR UPDATE SKIP LOCKED` details that differ). |
+| Q2 | Postgres or MySQL JSON columns? | **MySQL `JSON` type** with no schema enforcement on attributes/payload. Trade-off: no per-attribute index from day one. The production answer for this shape is a per-workspace attribute index — V4. |
 | Q3 | Queue technology for V1? | **In-process Go channel**, NOT RabbitMQ. V1 doesn't have multi-stage fan-out, so a broker buys nothing — adds infra, hides the single-process ceiling V2 needs to point at. Introduce RabbitMQ when V2's campaign fan-out demands it. |
-| Q4 | Roaring bitmap library? | **Upstream `github.com/RoaringBitmap/roaring`** (or Customer.io's fork). The engineering lesson is *integrating* bitmaps into incremental segment maintenance — index design, when to rebuild vs. update incrementally, per-workspace memory accounting. **Do not write bitmap primitives from scratch.** |
+| Q4 | Roaring bitmap library? | **Upstream `github.com/RoaringBitmap/roaring`**. The engineering lesson is *integrating* bitmaps into incremental segment maintenance — index design, when to rebuild vs. update incrementally, per-workspace memory accounting. **Do not write bitmap primitives from scratch.** |
 | Q5 | Template engine? | **Go `text/template`** for V1+V2; Liquid is a yak (lexer/parser, custom tags, sandboxing). Mention as a V4 enhancement. |
 | Q6 | Multi-tenancy — its own tier or cross-cutting? | **Cross-cutting from V1.** `workspace_id` on every row, queue key, and span attribute. Otherwise V3 becomes a rewrite, not a delta. |
-| Q7 | Scale targets — absolute numbers or bottleneck narratives? | **Bottleneck-migration narratives** with hardware specs at the top of each tier's writeup. "V1 ceiling = single-writer MySQL contention at ~N writes/sec on this box; V2 changes Y, new ceiling is Z" reads honest. Fabricated laptop numbers read as fabricated to a Customer.io reviewer. |
+| Q7 | Scale targets — absolute numbers or bottleneck narratives? | **Bottleneck-migration narratives** with hardware specs at the top of each tier's writeup. "V1 ceiling = single-writer MySQL contention at ~N writes/sec on this box; V2 changes Y, new ceiling is Z" reads honest. Fabricated laptop numbers are transparent to anyone who has run load tests. |
 | Q8 | V1 service boundary — one binary or many? | **Two binaries**: `track-api` + `stub-receiver`. Anything beyond a stub receiver lives behind the in-process channel; spinning out a `campaign-worker` binary is a V1.1 PR if needed. |
 | Q9 | Journey FSM — V3 or V4? | **V3, design-doc-only — written up in §3.3 (0.3.0-draft), unimplemented.** Three step types as capped: `send`, `delay`, `branch_on_condition`. Persisted runs in MySQL, claimed with `FOR UPDATE SKIP LOCKED`. Two refinements the design forced: the scheduler sleeps until `MIN(wake_at)` rather than polling a fixed tick (it shares the write bottleneck it adds to), and it is **not** single-process by necessity — `SKIP LOCKED` makes N replicas safe, so single-process is a default, not a constraint. |
-| Q10 | V1 segment evaluation: scan, materialised view, or roaring bitmap? | **Scan-based** in V1 — for each `/check`, read the person row + `LIMIT 1000` recent events, evaluate the condition tree in-process. Roaring bitmaps with incremental membership maintenance arrive in V2 (`customerio/roaring`-style). The V1 ceiling is the read-amplification of "scan events on every check"; the V2 mechanism removes it. Same `Condition` API survives the swap. |
+| Q10 | V1 segment evaluation: scan, materialised view, or roaring bitmap? | **Scan-based** in V1 — for each `/check`, read the person row + `LIMIT 1000` recent events, evaluate the condition tree in-process. Roaring bitmaps with incremental membership maintenance arrive in V2. The V1 ceiling is the read-amplification of "scan events on every check"; the V2 mechanism removes it. Same `Condition` API survives the swap. |
 | Q11 | What does the V1 segment grammar cover? | **Six ops:** `and`/`or`/`not` boolean; `attr_eq`/`attr_exists` over `person.attributes`; `event_seen` over the person's full event history in the workspace. Time-window predicates (`event_seen_within_30d`), count thresholds (`event_count > N`), arithmetic comparisons (`gt`/`lt`) — all out of V1; V1.x or V2. |
 
 ---
@@ -757,6 +757,7 @@ bottleneck-migration narrative with hardware-pinned numbers.
 
 | Version | Date       | Author        | Notes |
 |---------|------------|---------------|-------|
+| 0.3.9   | 2026-07-29 | Steve Weiland | **V3 complete.** (1) **Scheduler concurrency fix** for the bottleneck BM‑140 identified: bounded parallelism over a claimed batch, replacing `for i := range runs { executeRun(...) }`. End-to-end **42 → 503 runs/s, 12×**. Shipping it introduced and then caught a deadlock: `Concurrency` was left at its zero value because a config patch silently failed to apply, which made the batch semaphore an *unbuffered* channel — every goroutine blocked on its send, `wg.Wait()` never returned, and runs stranded in `running`. `NewScheduler` now floors it at 1 rather than trusting the caller. That is the **fourth** instance in this project of a change that looked applied and wasn't. (2) **V3-1c** (BM‑114 now enforced): `journey_versions` (append-only, immutable per version, cached forever), `PUT /journeys/{id}` bumping and snapshotting in one transaction, and the scheduler resolving the *pinned* version. Verified: a run enrolled on v1 finished on v1 while the journey advanced to v2 mid-`delay`. (3) **BM‑140 re-measured**: V2 956 events/s fan-out vs V3 762 fan-out and **503 runs/s end-to-end** — a **1.9× reduction against the 3–5× predicted**, so durability costs much less than feared, and the earlier 20× was purely the sequential-execution bug. (4) Docs de-branded: vendor names and audience-specific framing removed from spec, README, and code comments. The engineering reasoning stands without them, and MySQL's rationale is now stated on its own merits (deliberately the less-familiar engine). |
 | 0.3.8   | 2026-07-29 | Steve Weiland | **BM‑140 measured on a fresh DB; the tier's own prediction was wrong in both directions.** Fan-out fell only **861 → 637 events/s (1.35×)**, not the predicted 3–5× — one extra run `INSERT` per event is cheap. But end-to-end completion ran at just **42 runs/s** (2,450 of 36,908 runs finished), so V3's real ceiling is **~20× below** V2's, far worse than predicted. **And the cause is not the predicted one.** MySQL writes were never the constraint: the scheduler executes a claimed batch *sequentially* — one run at a time in a single goroutine, each doing a person read + gate insert + HTTP POST + two updates, ~24 ms serially, which is exactly the 42/s observed. The claim is batched and SKIP-LOCKED-safe; the execution is not concurrent at all. So §3.3's "new bottleneck: MySQL writes dominated by FSM transitions" is unsupported, and Q17 (where high-churn run state belongs) is premature — the design hasn't earned the right to blame the database yet. Named new bottleneck: **scheduler step concurrency**, fixable with the bounded worker pool V2-1 already established on the fan-out path. Baseline validity was confirmed behaviourally (`journey_runs = 0`) after the 0.3.7 plumbing bug, not by grepping logs. Two predictions in this tier now measured, both wrong: the isolation mechanism wasn't needed, and the throughput cost came from somewhere the spec never considered. |
 | 0.3.7   | 2026-07-29 | Steve Weiland | **BM‑140 attempted, not established.** V3 arm is clean: intake 7,577 events/s, fan-out ~250 events/s, scheduler ~141 runs/s completed. The V2 baseline arm is invalid twice over, so **no reduction ratio is claimed** — the spec's 3–5× prediction remains untested. First failure: `JOURNEYS=off` was never declared in `docker-compose.yml`, so the baseline ran with journeys on and both arms returned ~250/s. Second: the readiness check grepped a `--tail` of a busy log and was unreliable. `JOURNEYS` is now plumbed through compose with a comment noting this is the **third** occurrence of that exact bug class in this project (`CAMPAIGN_BATCH`, the journey `then` field, now this) — a documented toggle that silently does nothing. Worth stating as a standing caveat: every A/B claim here is only as trustworthy as the plumbing behind its toggle, and two of the three were caught only by checking the *result* for implausibility rather than by reading the code. Finish this on a fresh DB — the current one carries ~450k enrollments and PR 13 established that table size dominates insert rate. |
 | 0.3.6   | 2026-07-29 | Steve Weiland | **BM‑135 measured; the V3-3 admission caps are DELETED.** 8 busy workspaces, c=25 each (≈200 aggregate concurrency), `MYSQL_MAX_OPEN_CONNS=16`, identical 41 s windows: caps OFF **5,389/s** (220,960 enrollments), caps ON **769/s** (31,548). A **7× throughput loss for no benefit**. The hypothesis was wrong in the opposite direction from expected: MySQL and the connection pool handle oversubscription gracefully — requests queue briefly and complete — whereas a hard in-flight cap of 12 limits the worker to 12 concurrent no matter how much capacity is free. Combined with BM‑133 (caps unnecessary for fairness, because per-workspace queues + `Qos(global=false)` already isolate tenants), the mechanism failed both of its justifications and `internal/campaign/limiter.go` is removed along with its wiring and compose knobs. **What survives from V3-3:** the fair scheduler claim (BM‑131), which closed a real demonstrated gap — a plain `ORDER BY wake_at LIMIT n` genuinely did let one tenant's overdue backlog fill every batch forever. BM‑130/135 are kept as withdrawn requirements rather than deleted, because the reasoning is the artefact: a plausible mechanism, argued from first principles, killed by two measurements. That is the tier's actual finding and it is more useful than the feature would have been. |

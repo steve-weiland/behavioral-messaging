@@ -1,6 +1,6 @@
 # Behavioral Messaging Platform
 
-A multi-tenant behavioral messaging platform — Customer.io-inspired MVP
+A multi-tenant behavioral messaging platform — a product-shaped MVP
 sized to fit a laptop. Event-driven by design: a person performs an
 action, the platform stores the event, evaluates segment membership and
 campaign triggers, and dispatches a per-person message via a stub
@@ -15,7 +15,7 @@ changed, what now breaks" writeup with hardware-pinned measurements.
 | | |
 |--|--|
 | **Spec** | [`spec.md`](./spec.md) — RFC-2119 V1 + V2 + V3 requirements |
-| **Status** | **V1 + V2 complete**; V3 in progress — journeys + runs + `SKIP LOCKED` scheduler with send-gate (V3-1a/b), retry ladder + operable DLQ (V3-2), and per-workspace admission caps (V3-3 mechanisms) are built. The isolation *demonstration* (BM‑133) is not yet satisfied — see below. Remaining: version-pinning enforcement, ceiling re-measure (spec 0.3.4). |
+| **Status** | **V1 + V2 + V3 complete** (spec 0.3.9). All three tiers built, measured, and written up — including two mechanisms that measurement told us to delete. |
 | **Stack** | Go 1.25 · MySQL 8.0 · RabbitMQ 3.13 · OpenTelemetry SDK + Collector 0.151 · Tempo 2.10 · Prometheus 3.11 · Loki 3.7 · Grafana Alloy v1.16 · Grafana 13.0 · `docker compose` |
 
 **The tier story in four numbers.** Fan-out throughput **196/s → ~2,800/s**
@@ -41,7 +41,7 @@ a single shared MySQL's write throughput.
 |---|---|---|
 | **V1 Foundation** | Workspace-scoped from day 1. Single-process per service, single MySQL, in-process channel queue, scan-based segment eval, sync stub dispatch. | (baseline — sets the first ceiling) |
 | **V2 Throughput** | Roaring bitmaps for segments + RabbitMQ async fan-out + batched idempotent enrollment. | **Measured: shared single-MySQL write throughput.** Not render CPU or bitmap memory — those were the guesses going in, and neither is reached while one MySQL gates every event's two inserts. |
-| **V3 Durability** *(in progress — [spec §3.3](./spec.md#33-v3--durability))* | Persisted journey FSM (`SKIP LOCKED` claim + leases) + retry ladder with a DLQ that fills. | **Measured, and both predictions were wrong.** Fan-out fell only 1.35× (861 → 637 events/s), not 3–5×. But end-to-end completion is **42 runs/s** — ~20× below V2 — and the cause isn't MySQL writes: the scheduler executes each claimed batch **sequentially**. Named new bottleneck: scheduler step concurrency. See [§ V3 ceiling](#v3-ceiling-measured-2026-07-29). |
+| **V3 Durability** | Persisted journey FSM (`SKIP LOCKED` claim + leases + version pinning) + retry ladder with a DLQ that fills. | **Measured at a 1.9× throughput reduction, against 3–5× predicted** — durability cost far less than feared. The bottleneck turned out to be the scheduler executing batches sequentially, not MySQL writes; fixing that was a 12× end-to-end gain. See [§ V3 ceiling](#v3-ceiling-measured-2026-07-29). |
 
 Multi-tenancy is **not** a tier — it's a cross-cutting V1 property
 (`workspace_id` on every row, queue key, and span attribute).
@@ -82,7 +82,7 @@ MYSQL_MAX_OPEN_CONNS=25 make up   # the pre-PR-12 pool size
 ## V1 ceiling on this hardware
 
 > The headline scale number is "observed on this hardware," not absolute.
-> A Customer.io reviewer sees through fabricated laptop numbers immediately.
+> Fabricated laptop numbers are transparent to anyone who has run load tests.
 > The narrative is the **bottleneck-migration story**, not the throughput.
 
 ### Hardware
@@ -477,31 +477,36 @@ loadgen c=100/30 s, tables truncated between arms. The baseline's validity was
 confirmed behaviourally — `journey_runs = 0` with `JOURNEYS=off` — after an
 earlier attempt was invalidated by a toggle that wasn't wired through compose.
 
-| | intake | fan-out (worker) | end-to-end (runs `done`) |
-|---|---|---|---|
-| **V2** (`JOURNEYS=off`) | 4,887/s | **861 events/s** | — |
-| **V3** (journeys on) | 4,666/s | **637 events/s** | **42 runs/s** |
+| | fan-out (worker) | end-to-end (runs `done`) |
+|---|---|---|
+| **V2** (`JOURNEYS=off`) | **956 events/s** | — |
+| **V3**, first attempt | 637 events/s | **42 runs/s** |
+| **V3**, after the fix | **762 events/s** | **503 runs/s** |
 
-The spec predicted a 3–5× throughput reduction from write amplification, with
-MySQL writes as the new bottleneck. **Both halves were wrong.**
+The spec predicted a **3–5× reduction** from write amplification, with MySQL
+writes as the new bottleneck. Both halves were wrong, and the interesting part is
+*how*.
 
-Fan-out fell only **1.35×** — one extra run `INSERT` per event is cheap, and the
-predicted amplification barely registered on that path. But end-to-end
-completion ran at **42 runs/s**, ~20× below V2, because the scheduler finished
-only 2,450 of the 36,908 runs it was handed.
+**The first measurement showed ~20× — and that was a bug, not the
+architecture.** The scheduler claimed batches correctly but executed them
+`for i := range runs { executeRun(...) }`: one run at a time, in a single
+goroutine, each doing a person read, a gate insert, an HTTP POST and two updates.
+About 24 ms serially, which is exactly the 42/s observed. The *claim* was batched
+and `SKIP LOCKED`-safe; the *execution* had no concurrency at all.
 
-**The bottleneck is the scheduler executing each claimed batch sequentially** —
-`for i := range runs { executeRun(...) }`, one run at a time in a single
-goroutine, each doing a person read, a gate insert, an HTTP POST, and two
-updates. About 24 ms per run serially, which is exactly the 42/s observed. The
-*claim* is batched and `SKIP LOCKED`-safe; the *execution* has no concurrency at
-all.
+Bounded concurrency over the claimed batch — the same shape the fan-out worker
+learned in V2-1, and always safe because each run is a distinct row already
+leased to this replica — took end-to-end from **42 → 503 runs/s, a 12×
+improvement**.
 
-So MySQL was never reached. The fix is the lesson V2-1 already learned on the
-fan-out path — a bounded worker pool over the claimed batch — and it has to be
-tried before any storage-level conclusion. Spec Q17 ("where does high-churn run
-state belong?") is premature: this design hasn't earned the right to blame the
-database yet.
+**Final verdict: a 1.9× reduction** (956 → 503), not 3–5×. Durability cost
+materially less than the spec feared. And 27,664 of 41,870 runs had finished when
+the window closed, so 503/s is a floor.
+
+**What the bottleneck actually is: still unestablished.** Neither arm was driven
+to saturation after the fix, and MySQL was never shown to be the constraint — so
+spec Q17 ("where does high-churn run state belong?") stays premature. This design
+hasn't earned the right to blame the database.
 
 ## What the isolation tier taught
 
@@ -567,9 +572,11 @@ decision wasn't needed.
 
 ## Why these decisions
 
-**MySQL, not Postgres.** Customer.io stack alignment + fills the CV gap
-explicitly called out in the role evaluation. Postgres depth from prior
-builds transfers.
+**MySQL, not Postgres.** Deliberately the less-familiar engine of the two:
+prior builds in this series used Postgres, so the transferable knowledge was
+already banked and the gap worth closing was MySQL's — JSON columns without
+`jsonb`, `ON DUPLICATE KEY UPDATE` instead of `ON CONFLICT`, and
+`FOR UPDATE SKIP LOCKED` semantics that differ in the details.
 
 **Workspace-scoped from V1.** Multi-tenancy is a cross-cutting property
 (`workspace_id` on every row, queue key, span attribute) — not its own
@@ -583,7 +590,7 @@ V2's campaign fan-out demands it.
 **Bottleneck-migration narratives, not absolute throughput numbers.**
 "V1 ceiling = single-writer MySQL contention at ~N writes/sec on this
 hardware; V2 changes Y, new ceiling is Z" reads honest. Fabricated
-laptop numbers read as fabricated to a Customer.io reviewer.
+laptop numbers are transparent to anyone who has run load tests.
 
 **Drop-in Build 5 observability scaffold.** No reinventing OTel, dashboards,
 or log shipping. Day-1 dashboards.
@@ -609,6 +616,6 @@ or log shipping. Day-1 dashboards.
 
 ## Reading
 
-- Customer.io's `customerio/roaring` and `customerio/esdb` — public artefacts that tell you how they think
+- `RoaringBitmap/roaring` — the compressed-bitmap library behind the V2-2 segment index
 - Martin Kleppmann, *DDIA* ch. 11 (stream processing)
 - Google SRE workbook ch. 5 (multi-window multi-burn-rate alerts) — carried over from Build 5

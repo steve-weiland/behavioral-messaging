@@ -227,6 +227,9 @@ services:
       STUB_RECEIVER_URL: http://stub-receiver:8081
       MYSQL_MAX_OPEN_CONNS: "${MYSQL_MAX_OPEN_CONNS:-50}"
       SCHEDULER_BATCH: "${SCHEDULER_BATCH:-50}"
+      # BM-140: bounded parallelism over a claimed batch. 1 reproduces the
+      # sequential execution that was the measured V3 ceiling.
+      SCHEDULER_CONCURRENCY: "${SCHEDULER_CONCURRENCY:-16}"
       SCHEDULER_LEASE: "${SCHEDULER_LEASE:-30s}"
       SCHEDULER_MAX_SLEEP: "${SCHEDULER_MAX_SLEEP:-5s}"
       # Q16 — a gate row stuck in 'sending' is unknowable; skip never

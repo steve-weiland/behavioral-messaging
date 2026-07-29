@@ -1,6 +1,6 @@
 // Package person — V1 person profile store.
 //
-// Customer.io's identify semantics: an upsert that MERGES new attributes
+// Identify semantics: an upsert that MERGES new attributes
 // into existing ones. Send `{plan: "pro"}` then `{city: "Sydney"}` and the
 // row holds both. Send `{plan: null}` and the `plan` key is deleted.
 //

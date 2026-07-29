@@ -118,7 +118,7 @@ func (s *server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("/campaigns", s.handleCampaignsPost)
 	mux.HandleFunc("/campaigns/", s.handleCampaignsGet)
 	mux.HandleFunc("/journeys", s.handleJourneysPost)
-	mux.HandleFunc("/journeys/", s.handleJourneysGet)
+	mux.HandleFunc("/journeys/", s.handleJourneyByID)
 	mux.HandleFunc("/events", s.handleEventsPost)
 }
 
@@ -629,7 +629,7 @@ func (s *server) handleEventsPost(w http.ResponseWriter, r *http.Request) {
 		ReceivedAt:  time.Now().UTC(),
 	}
 	// V1 PR 2: tracking auto-creates the person row with empty
-	// attributes if absent — matches Customer.io's identify-on-track
+	// attributes if absent — the conventional identify-on-track
 	// behavior. INSERT IGNORE is a no-op on PK collision so
 	// existing rows are never clobbered. (BM-29.)
 	if err := person.EnsureExists(r.Context(), s.db, workspace, req.PersonID); err != nil {
@@ -811,6 +811,85 @@ func (s *server) handleJourneysPost(w http.ResponseWriter, r *http.Request) {
 //
 // The run read is what makes the V3-1a milestone checkable without opening a
 // MySQL shell: it shows the step index and status the scheduler will act on.
+// handleJourneyByID routes GET (definition / run) and PUT (new version).
+func (s *server) handleJourneyByID(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.handleJourneysGet(w, r)
+	case http.MethodPut:
+		s.handleJourneysPut(w, r)
+	default:
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+// handleJourneysPut publishes a new version of a journey (V3-1c / BM-114).
+// In-flight runs keep executing the version they pinned — the whole reason
+// versions exist rather than editing in place.
+func (s *server) handleJourneysPut(w http.ResponseWriter, r *http.Request) {
+	workspace := r.Header.Get("X-Workspace-ID")
+	if !validShortID(workspace) {
+		writeErr(w, http.StatusBadRequest, "X-Workspace-ID required ([A-Za-z0-9_-]{1,64})")
+		return
+	}
+	journeyID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/journeys/"), "/")
+	if !validShortID(journeyID) {
+		writeErr(w, http.StatusBadRequest, "journey_id required in path")
+		return
+	}
+	body, err := readBody(r, maxJourneyBodyBytes)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var req defineJourneyRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if req.Name == "" || len(req.Name) > 255 {
+		writeErr(w, http.StatusBadRequest, "name required, ≤ 255 chars")
+		return
+	}
+	if len(req.Trigger) == 0 {
+		writeErr(w, http.StatusBadRequest, "trigger required")
+		return
+	}
+	cond, err := segment.DecodeCondition(req.Trigger)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "trigger: "+err.Error())
+		return
+	}
+	if err := cond.Validate(); err != nil {
+		writeErr(w, http.StatusBadRequest, "trigger: "+err.Error())
+		return
+	}
+	if err := journey.ValidateSteps(req.Steps); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	version, err := journey.Update(r.Context(), s.db, journey.Journey{
+		WorkspaceID: workspace, JourneyID: journeyID,
+		Name: req.Name, Trigger: req.Trigger, Steps: req.Steps,
+	})
+	if errors.Is(err, journey.ErrNotFound) {
+		writeErr(w, http.StatusNotFound, "not found")
+		return
+	}
+	if err != nil {
+		slog.ErrorContext(r.Context(), "journey update failed",
+			slog.String("journey_id", journeyID), slog.Any("error", err))
+		writeErr(w, http.StatusInternalServerError, "store failed")
+		return
+	}
+	slog.InfoContext(r.Context(), "journey version published",
+		slog.String("workspace_id", workspace),
+		slog.String("journey_id", journeyID),
+		slog.Uint64("version", uint64(version)))
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(fmt.Sprintf(`{"status":"ok","version":%d}`, version)))
+}
+
 func (s *server) handleJourneysGet(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")

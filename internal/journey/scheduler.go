@@ -10,6 +10,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -43,13 +45,16 @@ type Scheduler struct {
 	stubURL string
 	hc      *http.Client
 
-	batch      int
-	fair       bool // BM-131: divide each batch across workspaces with due work
-	tickN      int
-	lease      time.Duration
-	maxSleep   time.Duration
-	stuckPol   string // send-gate stuck policy: "skip" | "retry" (Q16)
-	stuckAfter time.Duration
+	batch       int
+	concurrency int  // BM-140: bounded parallelism over a claimed batch
+	fair        bool // BM-131: divide each batch across workspaces with due work
+	tickN       int
+	lease       time.Duration
+	maxSleep    time.Duration
+	stuckPol    string // send-gate stuck policy: "skip" | "retry" (Q16)
+	stuckAfter  time.Duration
+
+	versions sync.Map // (ws,journey,version) -> *Journey, immutable so cached forever
 
 	steps     metric.Int64Counter
 	claims    metric.Int64Histogram
@@ -61,6 +66,7 @@ type SchedulerConfig struct {
 	ID          string
 	StubURL     string
 	Batch       int
+	Concurrency int
 	Fair        bool
 	Lease       time.Duration
 	MaxSleep    time.Duration
@@ -69,6 +75,17 @@ type SchedulerConfig struct {
 }
 
 func NewScheduler(db *sql.DB, hc *http.Client, cfg SchedulerConfig) *Scheduler {
+	// A zero here is fatal, not merely slow: the batch semaphore would be an
+	// UNBUFFERED channel, every goroutine would block on its send, and
+	// wg.Wait() would never return — the scheduler hangs after its first claim
+	// with runs stranded in 'running'. Cost me a debugging round when a config
+	// patch silently failed to apply, so it's guarded rather than trusted.
+	if cfg.Concurrency < 1 {
+		cfg.Concurrency = 1
+	}
+	if cfg.Batch < 1 {
+		cfg.Batch = 1
+	}
 	m := otel.Meter("journeys")
 	steps, err := m.Int64Counter("journey_steps_total",
 		metric.WithDescription("Journey steps executed. Labels: type, outcome."))
@@ -87,7 +104,7 @@ func NewScheduler(db *sql.DB, hc *http.Client, cfg SchedulerConfig) *Scheduler {
 	}
 	return &Scheduler{
 		db: db, id: cfg.ID, stubURL: cfg.StubURL, hc: hc,
-		batch: cfg.Batch, fair: cfg.Fair, lease: cfg.Lease, maxSleep: cfg.MaxSleep,
+		batch: cfg.Batch, concurrency: cfg.Concurrency, fair: cfg.Fair, lease: cfg.Lease, maxSleep: cfg.MaxSleep,
 		stuckPol: cfg.StuckPolicy, stuckAfter: cfg.StuckAfter,
 		steps: steps, claims: claims, gateSkips: skips,
 	}
@@ -98,7 +115,7 @@ func (s *Scheduler) Run(ctx context.Context) {
 	slog.Info("journey scheduler started",
 		slog.String("id", s.id), slog.Int("batch", s.batch),
 		slog.Duration("lease", s.lease), slog.Duration("max_sleep", s.maxSleep),
-		slog.Bool("fair_claim", s.fair),
+		slog.Bool("fair_claim", s.fair), slog.Int("concurrency", s.concurrency),
 		slog.String("send_gate_stuck_policy", s.stuckPol))
 	for {
 		n, err := s.tick(ctx)
@@ -130,9 +147,31 @@ func (s *Scheduler) tick(ctx context.Context) (int, error) {
 	if len(runs) == 0 {
 		return 0, nil
 	}
+	// Execute the claimed batch CONCURRENTLY, bounded (BM-140).
+	//
+	// This was the V3 ceiling: the batch was claimed in one go but executed
+	// with `for i := range runs { executeRun(...) }` — one run at a time in a
+	// single goroutine, each doing a person read + gate insert + HTTP POST +
+	// two updates. ~24ms serially, measured at 42 runs/s end-to-end while the
+	// fan-out worker managed 637 events/s. MySQL was never the constraint;
+	// the scheduler simply never did two things at once.
+	//
+	// Same shape the fan-out worker already uses: bounded concurrency, sized
+	// so total in-flight DB work stays sane. The claim was always safe to
+	// parallelize — each run is a distinct row already locked to this replica
+	// by the lease.
+	sem := make(chan struct{}, s.concurrency)
+	var wg sync.WaitGroup
 	for i := range runs {
-		s.executeRun(ctx, &runs[i])
+		wg.Add(1)
+		go func(r *Run) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			s.executeRun(ctx, r)
+		}(&runs[i])
 	}
+	wg.Wait()
 	return len(runs), nil
 }
 
@@ -313,21 +352,12 @@ func (s *Scheduler) executeRun(ctx context.Context, r *Run) {
 		))
 	defer span.End()
 
-	j, err := Get(ctx, s.db, r.WorkspaceID, r.JourneyID)
+	// V3-1c: resolve the EXACT version this run pinned (BM-114), not whatever
+	// the journey currently says. A person halfway through a journey finishes
+	// on the definition they enrolled on.
+	j, err := s.pinnedVersion(ctx, r)
 	if err != nil {
-		s.fail(ctx, r, "journey definition unreadable: "+err.Error())
-		return
-	}
-	// BM-114: runs pin a version. Storing per-version definitions is V3-1c;
-	// until then a bumped version is surfaced rather than silently applied.
-	if j.Version != r.JourneyVersion {
-		slog.WarnContext(ctx, "run pinned to a different journey version than the stored definition",
-			slog.String("run_id", r.RunID),
-			slog.Uint64("run_version", uint64(r.JourneyVersion)),
-			slog.Uint64("stored_version", uint64(j.Version)))
-	}
-	if err := j.Compile(); err != nil {
-		s.fail(ctx, r, "journey definition uncompilable: "+err.Error())
+		s.fail(ctx, r, "pinned journey definition unreadable: "+err.Error())
 		return
 	}
 
@@ -381,6 +411,26 @@ func (s *Scheduler) executeRun(ctx context.Context, r *Run) {
 	default:
 		s.fail(ctx, r, "unknown step type "+step.Type)
 	}
+}
+
+// pinnedVersion resolves and compiles the definition a run enrolled on.
+// Versions are immutable, so the compiled result is cached indefinitely — this
+// keeps the per-step read off MySQL entirely after first touch, which matters
+// now that steps run concurrently.
+func (s *Scheduler) pinnedVersion(ctx context.Context, r *Run) (*Journey, error) {
+	key := r.WorkspaceID + "\x00" + r.JourneyID + "\x00" + strconv.FormatUint(uint64(r.JourneyVersion), 10)
+	if v, ok := s.versions.Load(key); ok {
+		return v.(*Journey), nil
+	}
+	j, err := GetVersion(ctx, s.db, r.WorkspaceID, r.JourneyID, r.JourneyVersion)
+	if err != nil {
+		return nil, err
+	}
+	if err := j.Compile(); err != nil {
+		return nil, fmt.Errorf("compile: %w", err)
+	}
+	s.versions.Store(key, j)
+	return j, nil
 }
 
 // executeSend is the gated send (BM-118). The gate is what makes lease reclaim

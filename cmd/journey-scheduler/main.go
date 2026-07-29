@@ -69,6 +69,10 @@ func main() {
 		ID:      envOr("SCHEDULER_ID", serviceName+"-"+hostnameOr("1")),
 		StubURL: envOr("STUB_RECEIVER_URL", "http://stub-receiver:8081"),
 		Batch:   batch,
+		// BM-140 named sequential step execution as the V3 ceiling. Bounded
+		// parallelism over the claimed batch, kept below the MySQL pool so
+		// concurrent steps don't queue on connections.
+		Concurrency: envInt("SCHEDULER_CONCURRENCY", 16),
 		// BM-131: divide each claim batch across workspaces with due work, so
 		// one tenant's overdue backlog can't monopolize every tick.
 		// SCHEDULER_FAIR=off restores the global ORDER BY wake_at for the A/B.

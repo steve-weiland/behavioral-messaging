@@ -44,7 +44,90 @@ func Create(ctx context.Context, db *sql.DB, j Journey) error {
 		}
 		return fmt.Errorf("create journey: %w", err)
 	}
+	// Snapshot v1 so a run enrolling immediately can resolve its pinned
+	// definition (BM-114).
+	return snapshotVersion(ctx, db, j, 1, steps)
+}
+
+// snapshotVersion records an immutable copy of a definition. Called on create
+// and on every update, so a run can always resolve the exact definition it
+// enrolled on (BM-114).
+func snapshotVersion(ctx context.Context, db execer, j Journey, version uint32, steps []byte) error {
+	const q = `
+		INSERT INTO journey_versions (workspace_id, journey_id, version, trigger_def, steps)
+		VALUES (?, ?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE version = version
+	`
+	if _, err := db.ExecContext(ctx, q, j.WorkspaceID, j.JourneyID, version, []byte(j.Trigger), steps); err != nil {
+		return fmt.Errorf("snapshot journey version: %w", err)
+	}
 	return nil
+}
+
+// Update bumps a journey to a new version and snapshots it. In-flight runs keep
+// executing the version they pinned (BM-114) — that's the whole point: a person
+// halfway through a 5-step journey must not have the ground shift under them.
+// Returns the new version.
+func Update(ctx context.Context, db *sql.DB, j Journey) (uint32, error) {
+	steps, err := json.Marshal(j.Steps)
+	if err != nil {
+		return 0, fmt.Errorf("marshal steps: %w", err)
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var cur uint32
+	err = tx.QueryRowContext(ctx,
+		`SELECT version FROM journeys WHERE workspace_id = ? AND journey_id = ? FOR UPDATE`,
+		j.WorkspaceID, j.JourneyID).Scan(&cur)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, fmt.Errorf("read current version: %w", err)
+	}
+	next := cur + 1
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE journeys SET name = ?, trigger_def = ?, steps = ?, version = ?
+		 WHERE workspace_id = ? AND journey_id = ?`,
+		j.Name, []byte(j.Trigger), steps, next, j.WorkspaceID, j.JourneyID); err != nil {
+		return 0, fmt.Errorf("update journey: %w", err)
+	}
+	if err := snapshotVersion(ctx, tx, j, next, steps); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return next, nil
+}
+
+// GetVersion reads the exact definition a run pinned. Versions are immutable,
+// so the result is safe to cache forever.
+func GetVersion(ctx context.Context, db *sql.DB, workspaceID, journeyID string, version uint32) (*Journey, error) {
+	const q = `
+		SELECT workspace_id, journey_id, version, trigger_def, steps
+		FROM journey_versions
+		WHERE workspace_id = ? AND journey_id = ? AND version = ?
+	`
+	var j Journey
+	var trig, steps []byte
+	err := db.QueryRowContext(ctx, q, workspaceID, journeyID, version).Scan(
+		&j.WorkspaceID, &j.JourneyID, &j.Version, &trig, &steps)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get journey version: %w", err)
+	}
+	j.Trigger = json.RawMessage(trig)
+	if err := json.Unmarshal(steps, &j.Steps); err != nil {
+		return nil, fmt.Errorf("decode steps: %w", err)
+	}
+	return &j, nil
 }
 
 // Get reads one journey definition. Returns ErrNotFound when absent.
