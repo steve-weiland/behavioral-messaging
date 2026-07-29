@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	github.com/RoaringBitmap/roaring/v2 v2.18.2
+	github.com/XSAM/otelsql v0.42.0
 	github.com/go-sql-driver/mysql v1.10.0
 	github.com/google/uuid v1.6.0
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.68.0

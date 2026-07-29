@@ -329,6 +329,45 @@ to the bottleneck, not the bottleneck itself.
 | http://localhost:9090/targets | Scrape health — `otel-collector` (app metrics) + `rabbitmq` (per-queue). |
 | `mysql -h 127.0.0.1 -P 3307 -ubm -pbm bm` | MySQL directly |
 
+## One event, one trace
+
+`POST /events` produces a single connected trace spanning three services, the
+broker, and MySQL. Verified shape (Tempo, `{resource.service.name="track-api"}`):
+
+```
+track-api.http                                track-api
+  sql.stmt.exec            INSERT IGNORE INTO people …     ← person ensure (BM-29)
+  sql.stmt.exec            INSERT INTO events …            ← the intake write
+  amqp.publish campaigns.fanout
+    amqp.consume campaigns.fanout.ws_alpha    campaign-worker
+      campaign.process
+        sql.stmt.query     SELECT … FROM campaigns …       ← only on cache miss / TTL refresh
+        sql.stmt.query     SELECT … FROM people …
+        HTTP POST
+          stub-receiver.http                  stub-receiver
+    amqp.consume segments.index.ws_alpha      segment-worker
+```
+
+It crosses the broker via W3C traceparent on the AMQP headers, and MySQL via
+`otelsql`. That last part landed late — the DB spans were billed as "a small
+follow-up commit" at V1 kickoff and stayed missing for the whole build, which
+meant the two writes every tier measurement blames for the ceiling were the
+only part of the system you couldn't see in a trace.
+
+**The batched enrollment write is the interesting exception.** A flush commits
+rows from many events at once, so it can't be a child of any single request —
+claiming otherwise would attribute one trace's latency to another. It emits its
+own span, linked to every event that contributed a row:
+
+```
+campaign.enroll_flush        enroll.batch_rows=64   links→ 64 contributing traces
+  sql.stmt.exec              INSERT INTO journey_enrollments … (one multi-row statement)
+```
+
+So the enrollment INSERT is reachable from each request's trace without
+pretending to belong to it. Span links exist for exactly this shape, and
+batching is what creates it.
+
 ## Watching the queue
 
 Prometheus scrapes the app metrics via the OTel collector, and RabbitMQ
@@ -360,6 +399,11 @@ rate(messaging_consume_dropped_total[1m])          # terminal → DLQ
 
 # enrollment batching effectiveness (V2-3): should sit near BATCH_MAX under load
 histogram_quantile(0.5, sum by (le) (rate(campaign_enroll_batch_rows_bucket[1m])))
+
+# pool pressure (otelsql). PR 12 raised the pool after inferring that requests
+# queued in front of MySQL; wait_count makes that directly visible now.
+rate(db_client_connections_wait_count_total[1m])
+db_client_connections_usage
 ```
 
 `chaos/watch-fanout.sh` samples the same backlog live from RabbitMQ's
@@ -396,8 +440,8 @@ behavioral-messaging/
 │   └── loadgen/                    Go load driver for the ceiling runs (replaced the bash driver in PR 8)
 ├── internal/
 │   ├── event/                      shared Event struct
-│   ├── eventstore/                 MySQL persistence + pool sizing (plain database/sql — otelsql still unwired, so
-│   │                               traces carry no DB spans; see spec §5)
+│   ├── eventstore/                 MySQL persistence + pool sizing + otelsql instrumentation (every query is a
+│   │                               span; pool utilization as db_client_connections_* metrics)
 │   ├── otelinit/                   Build 5 carryover — TracerProvider + MeterProvider
 │   ├── logsx/                      Build 5 carryover — slog JSON + trace_id/span_id
 │   ├── amqpx/                      V2 PR 6 — thin amqp091 wrapper (Connect/Publish/Consume + traceparent propagation)

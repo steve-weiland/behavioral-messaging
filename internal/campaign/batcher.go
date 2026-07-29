@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Batcher coalesces journey_enrollments inserts from many concurrent
@@ -55,6 +57,12 @@ type enrollRow struct {
 type enrollReq struct {
 	row  enrollRow
 	done chan error
+	// spanCtx is the submitting event's span context, captured so the flush
+	// can LINK back to it. A batch deliberately can't be a child of any one
+	// request — it commits rows from N different traces — but without links
+	// the enrollment write vanishes from every trace it belongs to, which is
+	// awkward when that write is the tier's named bottleneck.
+	spanCtx trace.SpanContext
 }
 
 var errBatcherClosed = errors.New("enrollment batcher closed")
@@ -112,7 +120,7 @@ func (b *Batcher) Submit(ctx context.Context, r enrollRow) error {
 	if atomic.LoadInt32(&b.closed) == 1 {
 		return errBatcherClosed
 	}
-	req := enrollReq{row: r, done: make(chan error, 1)}
+	req := enrollReq{row: r, done: make(chan error, 1), spanCtx: trace.SpanContextFromContext(ctx)}
 	select {
 	case b.ch <- req:
 	case <-ctx.Done():
@@ -201,9 +209,29 @@ func (b *Batcher) flush(batch []enrollReq) {
 	// a no-op rather than a duplicate row.
 	sb.WriteString(" ON DUPLICATE KEY UPDATE enrollment_id = enrollment_id")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// The flush gets its own span, linked to every event that contributed a
+	// row. It can't be a *child* of any of them — a batch belongs to N traces
+	// at once — so links are the honest representation, and they make the
+	// enrollment INSERT reachable from each contributing request's trace.
+	// otelsql then nests the statement span under this one.
+	links := make([]trace.Link, 0, len(batch))
+	for i := range batch {
+		if batch[i].spanCtx.IsValid() {
+			links = append(links, trace.Link{SpanContext: batch[i].spanCtx})
+		}
+	}
+	ctx, span := otel.Tracer("campaigns").Start(context.Background(), "campaign.enroll_flush",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithLinks(links...),
+		trace.WithAttributes(attribute.Int("enroll.batch_rows", len(batch))),
+	)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	_, err := b.exec(ctx, sb.String(), args...)
 	cancel()
+	if err != nil {
+		span.RecordError(err)
+	}
+	span.End()
 
 	b.batchRows.Record(context.Background(), int64(len(batch)))
 	for i := range batch {

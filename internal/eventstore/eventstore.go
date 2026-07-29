@@ -1,33 +1,77 @@
-// Package eventstore is the persistence layer for events.
+// Package eventstore is the persistence layer for events, and the single
+// place the MySQL pool is opened for every service.
 //
-// Thin wrapper around database/sql. otelsql is *not* wired in the V1
-// kickoff — that lands as a small follow-up commit so the bigger
-// scaffolding diff stays focused. Same pattern Build 5 used: minimal
-// V1 → tighten in a later PR.
+// The pool is instrumented with otelsql, so each query is a child span of
+// whatever context it runs under. That's what makes BM‑42's trace complete:
+// a POST /events trace now shows the intake INSERT under the HTTP server
+// span, and the enrollment INSERT under campaign.process on the worker —
+// the two writes the V2-2 measurement named as the ceiling. Before this they
+// were invisible, and the "MySQL is the bottleneck" conclusion rested
+// entirely on container CPU plus the journey_enrollments row slope.
 package eventstore
 
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
 
+	"github.com/XSAM/otelsql"
 	_ "github.com/go-sql-driver/mysql" // registers "mysql" sql driver
+	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
 
 	"github.com/steveweiland/behavioral-messaging/internal/event"
 )
 
-// Open returns a *sql.DB connected to MySQL via the canonical DSN.
+// Open returns an OTel-instrumented *sql.DB connected to MySQL.
 func Open(dsn string) (*sql.DB, error) {
-	db, err := sql.Open("mysql", dsn)
+	// otelsql.Open wraps the registered "mysql" driver. Spans carry the
+	// statement text: safe here because every query in this codebase is a
+	// constant with bound parameters — no user data is interpolated into
+	// SQL, so the span can't leak a person's attributes.
+	db, err := otelsql.Open("mysql", dsn,
+		otelsql.WithAttributes(semconv.DBSystemMySQL),
+		otelsql.WithSpanOptions(otelsql.SpanOptions{
+			// One span per statement is the useful grain. Left unfiltered,
+			// otelsql emits sql.conn.exec AND sql.stmt.exec for the same
+			// INSERT (the driver prepares, then executes), plus a sql.rows
+			// span per result set — three spans per query, which buries the
+			// two writes this exists to show. Keep the sql.stmt.* layer.
+			Ping:                 false,
+			RowsNext:             false,
+			DisableErrSkip:       true,
+			OmitConnResetSession: true,
+			OmitConnPrepare:      true,
+			OmitConnQuery:        true,
+			OmitRows:             true,
+			OmitConnectorConnect: true,
+			// OmitConnQuery covers sql.conn.query but not sql.conn.exec, and
+			// that one is pure noise here: go-sql-driver returns ErrSkip for a
+			// parameterized ExecContext (params aren't interpolated), so
+			// database/sql falls back to prepare + stmt.exec. The conn.exec
+			// span therefore describes a call that never executed, sitting
+			// next to the stmt.exec span that did.
+			SpanFilter: func(_ context.Context, method otelsql.Method, _ string, _ []driver.NamedValue) bool {
+				return method != otelsql.MethodConnExec
+			},
+		}),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("sql open: %w", err)
 	}
 	if err := db.Ping(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("ping: %w", err)
+	}
+	// Pool utilization as metrics (db_client_connections_*). The V2-2x pool
+	// finding — requests queuing on the pool in front of MySQL — was
+	// diagnosed by inference; these make wait_count/wait_duration directly
+	// observable next time.
+	if _, err := otelsql.RegisterDBStatsMetrics(db, otelsql.WithAttributes(semconv.DBSystemMySQL)); err != nil {
+		return nil, fmt.Errorf("register db stats metrics: %w", err)
 	}
 	// Pool size: default 50, overridable via MYSQL_MAX_OPEN_CONNS. The
 	// V2-2 write-ceiling diagnostic showed the old default of 25 throttled
