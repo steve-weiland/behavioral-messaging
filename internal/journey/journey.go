@@ -51,6 +51,15 @@ type Step struct {
 	IfTrue    *int            `json:"if_true,omitempty"`
 	IfFalse   *int            `json:"if_false,omitempty"`
 
+	// Then controls what happens after this step: "" / "next" continues to
+	// step_index+1, "end" finishes the run.
+	//
+	// This exists because branch arms are ranges in a FLAT list, so without it
+	// the if_true arm runs off its end and into the if_false arm — found by
+	// running a branching journey and watching one person receive both
+	// messages. A field rather than a fourth step type, so Q9's cap holds.
+	Then string `json:"then,omitempty"`
+
 	// Compiled artifacts, populated by Compile. Same reasoning as
 	// campaign.Campaign: decoding a condition and parsing a template per
 	// execution is waste on a path that already shares a write bottleneck.
@@ -137,9 +146,23 @@ func ValidateSteps(steps []Step) error {
 	return nil
 }
 
+// Step.Then values.
+const (
+	ThenNext = "next"
+	ThenEnd  = "end"
+)
+
+// EndsRun reports whether the run finishes after this step.
+func (s *Step) EndsRun() bool { return s.Then == ThenEnd }
+
 func validateStep(i int, s *Step, n int) error {
 	at := func(format string, a ...any) error {
 		return fmt.Errorf("steps[%d]: "+format, append([]any{i}, a...)...)
+	}
+	switch s.Then {
+	case "", ThenNext, ThenEnd:
+	default:
+		return at("then must be %q or %q (got %q)", ThenNext, ThenEnd, s.Then)
 	}
 	switch s.Type {
 	case StepSend:
@@ -190,6 +213,9 @@ func validateStep(i int, s *Step, n int) error {
 		}
 		if s.Template != "" || s.Seconds != 0 {
 			return at("branch_on_condition takes only condition/if_true/if_false")
+		}
+		if s.Then == ThenEnd {
+			return at("branch_on_condition cannot end the run — it must branch somewhere")
 		}
 	case "":
 		return at("type required (one of %s, %s, %s)", StepSend, StepDelay, StepBranch)

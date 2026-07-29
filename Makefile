@@ -79,7 +79,7 @@ seed-journey: ## V3-1a: define a journey, fire a trigger, then REDELIVER it — 
 	@if ! curl -fsS -H 'X-Workspace-ID: ws_alpha' http://localhost:8090/journeys/onboard_pro >/dev/null 2>&1; then \
 	  curl -fsS -X POST http://localhost:8090/journeys \
 	    -H "X-Workspace-ID: ws_alpha" -H "Content-Type: application/json" \
-	    -d '{"journey_id":"onboard_pro","name":"Pro onboarding","trigger":{"op":"event_seen","name":"signed_up"},"steps":[{"type":"delay","seconds":60},{"type":"branch_on_condition","condition":{"op":"attr_eq","key":"plan","value":"pro"},"if_true":2,"if_false":3},{"type":"send","template":"Your {{.Attrs.plan}} trial ends soon."},{"type":"send","template":"Upgrade to pro."}]}' && echo "   created"; \
+	    -d '{"journey_id":"onboard_pro","name":"Pro onboarding","trigger":{"op":"event_seen","name":"signed_up"},"steps":[{"type":"delay","seconds":10},{"type":"branch_on_condition","condition":{"op":"attr_eq","key":"plan","value":"pro"},"if_true":2,"if_false":3},{"type":"send","template":"Your {{.Attrs.plan}} trial ends soon.","then":"end"},{"type":"send","template":"Upgrade to pro."}]}' && echo "   created"; \
 	else echo "   already exists"; fi
 	@echo "2. identify pj_alice (plan=pro):"
 	@curl -fsS -X POST http://localhost:8090/people \

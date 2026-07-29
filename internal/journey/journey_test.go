@@ -198,3 +198,40 @@ func TestCreateRun_GeneratesRunID(t *testing.T) {
 		t.Fatalf("expected one insert, got %d", len(f.queries))
 	}
 }
+
+// Branch arms are ranges in a flat list, so without an explicit terminator the
+// if_true arm runs off its end and into the if_false arm — one person receives
+// both messages. Found by running a branching journey, not by reading it.
+func TestValidateSteps_Then(t *testing.T) {
+	ok := `[{"type":"branch_on_condition","condition":{"op":"attr_eq","key":"plan","value":"pro"},"if_true":1,"if_false":2},` +
+		`{"type":"send","template":"pro","then":"end"},` +
+		`{"type":"send","template":"free"}]`
+	if err := ValidateSteps(steps(t, ok)); err != nil {
+		t.Errorf("rejected a valid then:end arm: %v", err)
+	}
+
+	bad := map[string]struct{ raw, want string }{
+		"unknown then": {`[{"type":"send","template":"x","then":"stop"}]`, `then must be`},
+		"branch ends":  {`[{"type":"branch_on_condition","condition":{"op":"attr_exists","key":"p"},"if_true":1,"if_false":1,"then":"end"},` + sendStep + `]`, "cannot end the run"},
+	}
+	for name, tc := range bad {
+		t.Run(name, func(t *testing.T) {
+			err := ValidateSteps(steps(t, tc.raw))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("err = %v, want it to contain %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestStep_EndsRun(t *testing.T) {
+	for _, tc := range []struct {
+		then string
+		want bool
+	}{{"", false}, {ThenNext, false}, {ThenEnd, true}} {
+		s := Step{Type: StepSend, Template: "x", Then: tc.then}
+		if s.EndsRun() != tc.want {
+			t.Errorf("Then=%q EndsRun()=%v, want %v", tc.then, s.EndsRun(), tc.want)
+		}
+	}
+}

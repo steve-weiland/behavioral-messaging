@@ -15,7 +15,7 @@ changed, what now breaks" writeup with hardware-pinned measurements.
 | | |
 |--|--|
 | **Spec** | [`spec.md`](./spec.md) — RFC-2119 V1 + V2 + V3 requirements |
-| **Status** | **V1 + V2 complete**; V3 in progress — V3-1a (journeys + runs) built, scheduler next (spec 0.3.1). |
+| **Status** | **V1 + V2 complete**; V3 in progress — journeys, runs, and the `SKIP LOCKED` scheduler with a send-gate are built (V3-1a/b, spec 0.3.2). Retry ladder + per-workspace caps next. |
 | **Stack** | Go 1.25 · MySQL 8.0 · RabbitMQ 3.13 · OpenTelemetry SDK + Collector 0.151 · Tempo 2.10 · Prometheus 3.11 · Loki 3.7 · Grafana Alloy v1.16 · Grafana 13.0 · `docker compose` |
 
 **The tier story in four numbers.** Fan-out throughput **196/s → ~2,800/s**
@@ -53,7 +53,8 @@ make up            # docker compose up -d --build (12 services)
 make showcase      # every surface end-to-end: people → segment → campaign → events
 make seed          # POST 10 events at 1 req/s
 make seed-campaign # define welcome_pro + 2 people + fire signed_up — end-to-end smoke
-make seed-journey  # V3-1a: define a journey, fire a trigger, redeliver it — expect 1 run
+make seed-journey  # V3-1a/b: define a journey, fire a trigger, redeliver it, watch it run
+make journey-runs  # inspect journey_runs (step_index, status, wake_at)
 make load          # the ceiling-search run (= load-soak: 60s @ concurrency=20)
 make load-quick    # 10s burst @ concurrency=5 — sanity-check the driver
 make test          # go test ./...
@@ -419,6 +420,7 @@ during a ceiling run.
 | `stub-receiver` | `:8091` | container `:8081` |
 | `campaign-worker` | `:8092` | container `:8082`; tiny `/healthz` only |
 | `segment-worker` | `:8093` | container `:8083`; `/healthz` + `POST /internal/check` (V2-2) |
+| `journey-scheduler` | `:8094` | container `:8084`; `/healthz` only — advances journey runs (V3-1b) |
 | MySQL | `:3307` | container `:3306`; host `:3306` left for any local MySQL |
 | RabbitMQ | `:5672` (AMQP), `:15672` (mgmt), `:15692` (Prom) | guest/guest creds; mgmt UI in browser |
 | OTel collector | `:4317` | OTLP/gRPC; Prom scrape `:8889` |
@@ -438,6 +440,7 @@ behavioral-messaging/
 │   ├── campaign-worker/            V2 PR 7 — consumes per-workspace queues, runs the per-event Processor
 │   ├── segment-worker/             V2-2 — bitmap index: boot backfill + stream maintenance + /internal/check
 │   ├── stub-receiver/              V1 delivery sink
+│   ├── journey-scheduler/          V3-1b — claims due runs (SKIP LOCKED + leases), executes steps, gates sends
 │   └── loadgen/                    Go load driver for the ceiling runs (replaced the bash driver in PR 8)
 ├── internal/
 │   ├── event/                      shared Event struct
@@ -501,6 +504,7 @@ or log shipping. Day-1 dashboards.
 | `v0.2.x-segments` | V2 PRs 9–11 | V2-2. PR 9: `internal/segmentidx` engine (9 tests). PR 10: `cmd/segment-worker/` + `/check` repoint + `people.changes` feed. PR 11: campaign-worker hot-path repoint — campaign + attribute caches replace the per-event MySQL reads. Re-measured: worker backlog 9,134 → 83, ceiling migrated to shared MySQL writes ([§ V2-2 ceiling](#v2-2-hot-path-ceiling-measured-2026-05-29)). **Next:** write-side (read/write split, batch enrollment inserts, or shard). |
 | `v0.2.x-idempotency` | V2 PR 13 | V2-3 (Lean): migration 004 unique `(workspace_id, campaign_id, triggered_by)` + `INSERT … ON DUPLICATE KEY UPDATE` → redelivery never double-enrolls; `internal/campaign/batcher.go` coalesces enrollment inserts (~63 rows/flush). Backlog 156,961 → 166; 0 dup enrollments across 700k+ rows. Two-phase send-gate deferred to V3. |
 | `v0.2.6-closeout` | Close-out review | Closed the specified-but-unbuilt per-workspace queue-depth metric (BM‑82/86 — RabbitMQ scrape with `workspace_id` relabeled from the queue name); made the batching A/B reachable from the host; hoisted the per-event trigger decode + template parse to once per cache refresh; added `messaging.consume.requeued` so an unbounded requeue is visible. **Fixed a silent-loss bug in `Publisher.Submit`** found by writing its first test — see [§ What broke](#what-broke-the-producers-shutdown-race). Spec: duplicate `BM‑30..32` renumbered, tier table filled, out-of-scope reconciled, Q12–Q14 recorded. |
+| `v0.3.2-scheduler` | V3-1b | `cmd/journey-scheduler`: claims due runs with `FOR UPDATE SKIP LOCKED` (so replicas need no distributed lock), commits the claim before doing step work, holds a lease so a dead replica's runs are reclaimed, and gates every send on `idempotency_keys` keyed `run_id:step_index`. Verified exactly-once two ways — a simulated crash-after-POST and a real `docker kill` mid-journey. Found and fixed a fall-through bug: branch arms are ranges in a flat list, so the `if_true` arm ran into the `if_false` arm and one person got both messages; `then:"end"` fixes it without a fourth step type. |
 | `v0.3.1-journeys` | V3-1a | `journeys` + `journey_runs` schema, `internal/journey`, `POST/GET /journeys`, and enrollment on the per-event path — one run row per trigger, idempotent under redelivery (BM‑113, verified with a real duplicate delivery). The journey list is cached per workspace from day one: a per-event `ListByWorkspace` would have reintroduced the exact V2-1 bottleneck V2-2c removed. No scheduler yet, so runs sit at `step_index=0` waiting for V3-1b. |
 | `v0.3.0-durability` | V3 — **designed** | Full design in [spec §3.3](./spec.md#33-v3--durability) (BM‑110..140) with a PR sequence. V3-1: `journeys` + `journey_runs`, three step types, version pinning, `SKIP LOCKED` claim + leases, and the send-gate promoted from deferred to required (a leased FSM makes a repeat send reachable in normal operation, not just after a crash). V3-2: TTL retry ladder + a DLQ with `inspect`/`replay`. V3-3: per-workspace in-flight caps + a noisy-neighbour graph as the artefact. Ceiling is predicted to go *down* — see the tier ladder. |
 

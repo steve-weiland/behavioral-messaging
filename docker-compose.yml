@@ -203,6 +203,38 @@ services:
       otel-collector:
         condition: service_started
 
+  # V3-1b: journey-scheduler is the only component that executes journey
+  # steps. Claims due runs with FOR UPDATE SKIP LOCKED (so replicas are safe),
+  # holds a lease per claim (so a crash mid-step is reclaimable), and gates
+  # every send on idempotency_keys (so reclaim can't double-send).
+  journey-scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: journey-scheduler
+    environment:
+      MYSQL_DSN: "bm:bm@tcp(mysql:3306)/bm?parseTime=true&multiStatements=true"
+      OTEL_EXPORTER_OTLP_ENDPOINT: otel-collector:4317
+      OTEL_METRICS_EXEMPLAR_FILTER: trace_based
+      STUB_RECEIVER_URL: http://stub-receiver:8081
+      MYSQL_MAX_OPEN_CONNS: "${MYSQL_MAX_OPEN_CONNS:-50}"
+      SCHEDULER_BATCH: "${SCHEDULER_BATCH:-50}"
+      SCHEDULER_LEASE: "${SCHEDULER_LEASE:-30s}"
+      SCHEDULER_MAX_SLEEP: "${SCHEDULER_MAX_SLEEP:-5s}"
+      # Q16 — a gate row stuck in 'sending' is unknowable; skip never
+      # double-sends, retry never under-sends. Pick per message class in prod.
+      SEND_GATE_STUCK_POLICY: "${SEND_GATE_STUCK_POLICY:-skip}"
+      SEND_GATE_STUCK_AFTER: "${SEND_GATE_STUCK_AFTER:-2m}"
+      PORT: "8084"
+    ports:
+      - "8094:8084"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+
   # V2-2: segment-worker owns the roaring-bitmap index. Backfills from
   # MySQL at boot, then maintains bitmaps from the event stream
   # (campaigns.fanout) + the people.changes feed. Serves membership over
