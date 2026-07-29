@@ -41,7 +41,7 @@ a single shared MySQL's write throughput.
 |---|---|---|
 | **V1 Foundation** | Workspace-scoped from day 1. Single-process per service, single MySQL, in-process channel queue, scan-based segment eval, sync stub dispatch. | (baseline — sets the first ceiling) |
 | **V2 Throughput** | Roaring bitmaps for segments + RabbitMQ async fan-out + batched idempotent enrollment. | **Measured: shared single-MySQL write throughput.** Not render CPU or bitmap memory — those were the guesses going in, and neither is reached while one MySQL gates every event's two inserts. |
-| **V3 Durability** *(in progress — [spec §3.3](./spec.md#33-v3--durability))* | Persisted journey FSM (`SKIP LOCKED` claim + leases) + retry ladder with a DLQ that fills + per-workspace capacity caps. | **The one tier that lowers the ceiling on purpose** — ~10 writes per enrolled person vs V2's 2, so a predicted 3–5× throughput reduction bought in exchange for surviving a crash mid-journey. Predicted bottleneck: still MySQL writes, now dominated by FSM state transitions → V4 sharding. |
+| **V3 Durability** *(in progress — [spec §3.3](./spec.md#33-v3--durability))* | Persisted journey FSM (`SKIP LOCKED` claim + leases) + retry ladder with a DLQ that fills. | **Measured, and both predictions were wrong.** Fan-out fell only 1.35× (861 → 637 events/s), not 3–5×. But end-to-end completion is **42 runs/s** — ~20× below V2 — and the cause isn't MySQL writes: the scheduler executes each claimed batch **sequentially**. Named new bottleneck: scheduler step concurrency. See [§ V3 ceiling](#v3-ceiling-measured-2026-07-29). |
 
 Multi-tenancy is **not** a tier — it's a cross-cutting V1 property
 (`workspace_id` on every row, queue key, and span attribute).
@@ -469,6 +469,39 @@ behavioral-messaging/
 └── chaos/                          load-v1.sh (bash V1 driver) · watch-fanout.sh (live backlog+CPU sampler) ·
                                     ceiling-run.sh (V2 measured-run orchestrator; pairs with cmd/loadgen/)
 ```
+
+## V3 ceiling (measured 2026-07-29)
+
+Both arms on a fresh database, `ws_alpha`, 2 campaigns, a single-`send` journey,
+loadgen c=100/30 s, tables truncated between arms. The baseline's validity was
+confirmed behaviourally — `journey_runs = 0` with `JOURNEYS=off` — after an
+earlier attempt was invalidated by a toggle that wasn't wired through compose.
+
+| | intake | fan-out (worker) | end-to-end (runs `done`) |
+|---|---|---|---|
+| **V2** (`JOURNEYS=off`) | 4,887/s | **861 events/s** | — |
+| **V3** (journeys on) | 4,666/s | **637 events/s** | **42 runs/s** |
+
+The spec predicted a 3–5× throughput reduction from write amplification, with
+MySQL writes as the new bottleneck. **Both halves were wrong.**
+
+Fan-out fell only **1.35×** — one extra run `INSERT` per event is cheap, and the
+predicted amplification barely registered on that path. But end-to-end
+completion ran at **42 runs/s**, ~20× below V2, because the scheduler finished
+only 2,450 of the 36,908 runs it was handed.
+
+**The bottleneck is the scheduler executing each claimed batch sequentially** —
+`for i := range runs { executeRun(...) }`, one run at a time in a single
+goroutine, each doing a person read, a gate insert, an HTTP POST, and two
+updates. About 24 ms per run serially, which is exactly the 42/s observed. The
+*claim* is batched and `SKIP LOCKED`-safe; the *execution* has no concurrency at
+all.
+
+So MySQL was never reached. The fix is the lesson V2-1 already learned on the
+fan-out path — a bounded worker pool over the claimed batch — and it has to be
+tried before any storage-level conclusion. Spec Q17 ("where does high-churn run
+state belong?") is premature: this design hasn't earned the right to blame the
+database yet.
 
 ## What the isolation tier taught
 
