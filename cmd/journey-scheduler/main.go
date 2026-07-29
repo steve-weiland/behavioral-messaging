@@ -69,7 +69,11 @@ func main() {
 		ID:      envOr("SCHEDULER_ID", serviceName+"-"+hostnameOr("1")),
 		StubURL: envOr("STUB_RECEIVER_URL", "http://stub-receiver:8081"),
 		Batch:   batch,
-		Lease:   envDuration("SCHEDULER_LEASE", 30*time.Second),
+		// BM-131: divide each claim batch across workspaces with due work, so
+		// one tenant's overdue backlog can't monopolize every tick.
+		// SCHEDULER_FAIR=off restores the global ORDER BY wake_at for the A/B.
+		Fair:  envOr("SCHEDULER_FAIR", "on") != "off",
+		Lease: envDuration("SCHEDULER_LEASE", 30*time.Second),
 		// Cap on idle sleep so a newly created run is picked up promptly even
 		// though nothing signals the scheduler (BM-116).
 		MaxSleep: envDuration("SCHEDULER_MAX_SLEEP", 5*time.Second),

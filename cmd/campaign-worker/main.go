@@ -187,6 +187,21 @@ func main() {
 		slog.Info("retry ladder disabled (immediate requeue — V2 behavior)")
 	}
 
+	// V3-3 admission control (BM-130). Defaults: the global ceiling sits below
+	// the MySQL pool so in-flight work never queues on connections, and each
+	// workspace gets a slice of it.
+	var limiter *campaign.Limiter
+	if envOr("WORKSPACE_CAPS", "on") != "off" {
+		globalCap := envInt("MAX_INFLIGHT_TOTAL", 40)
+		wsCap := envInt("MAX_INFLIGHT_PER_WORKSPACE", 8)
+		limiter = campaign.NewLimiter(globalCap, wsCap)
+		slog.Info("per-workspace admission caps enabled",
+			slog.Int("max_inflight_total", globalCap),
+			slog.Int("max_inflight_per_workspace", wsCap))
+	} else {
+		slog.Info("per-workspace admission caps disabled (V2 behavior — aggregate unbounded)")
+	}
+
 	processor := campaign.NewProcessorWithCaches(db, httpClient, stubURL, attrCache, campCache, batcher)
 	if enroller != nil {
 		// Guarded: passing a nil *journey.Enroller through the interface
@@ -207,7 +222,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("ensure queue %s: %v", ws, err)
 		}
-		handler := makeHandler(processor, retrier)
+		handler := makeHandler(processor, retrier, limiter)
 		consumerTag := serviceName + "." + ws
 		if err := amqpx.Consume(rootCtx, amqpCh, queueName, prefetch, consumerTag, handler); err != nil {
 			log.Fatalf("consume %s: %v", queueName, err)
@@ -264,7 +279,7 @@ func main() {
 //
 // The old immediate Nack(requeue=true) is gone: it retried forever at full
 // speed while the DLQ stayed empty and looked healthy.
-func makeHandler(p *campaign.Processor, r *campaign.Retrier) amqpx.Handler {
+func makeHandler(p *campaign.Processor, r *campaign.Retrier, lim *campaign.Limiter) amqpx.Handler {
 	return func(ctx context.Context, d amqp.Delivery) amqpx.Outcome {
 		var ev event.Event
 		if err := json.Unmarshal(d.Body, &ev); err != nil {
@@ -277,6 +292,17 @@ func makeHandler(p *campaign.Processor, r *campaign.Retrier) amqpx.Handler {
 				}
 			}
 			return amqpx.OutcomeNackDrop
+		}
+		// V3-3: admission control before any work. Holding the slot for the
+		// whole of Process is the point — it bounds concurrent DB work, not
+		// just concurrent deliveries.
+		if lim != nil {
+			release, err := lim.Acquire(ctx, ev.WorkspaceID)
+			if err != nil {
+				// Shutting down; requeue rather than drop.
+				return amqpx.OutcomeNackRequeue
+			}
+			defer release()
 		}
 		outcome, reason := p.Process(ctx, ev)
 		if r == nil {

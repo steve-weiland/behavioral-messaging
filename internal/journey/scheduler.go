@@ -44,6 +44,8 @@ type Scheduler struct {
 	hc      *http.Client
 
 	batch      int
+	fair       bool // BM-131: divide each batch across workspaces with due work
+	tickN      int
 	lease      time.Duration
 	maxSleep   time.Duration
 	stuckPol   string // send-gate stuck policy: "skip" | "retry" (Q16)
@@ -59,6 +61,7 @@ type SchedulerConfig struct {
 	ID          string
 	StubURL     string
 	Batch       int
+	Fair        bool
 	Lease       time.Duration
 	MaxSleep    time.Duration
 	StuckPolicy string
@@ -84,7 +87,7 @@ func NewScheduler(db *sql.DB, hc *http.Client, cfg SchedulerConfig) *Scheduler {
 	}
 	return &Scheduler{
 		db: db, id: cfg.ID, stubURL: cfg.StubURL, hc: hc,
-		batch: cfg.Batch, lease: cfg.Lease, maxSleep: cfg.MaxSleep,
+		batch: cfg.Batch, fair: cfg.Fair, lease: cfg.Lease, maxSleep: cfg.MaxSleep,
 		stuckPol: cfg.StuckPolicy, stuckAfter: cfg.StuckAfter,
 		steps: steps, claims: claims, gateSkips: skips,
 	}
@@ -95,6 +98,7 @@ func (s *Scheduler) Run(ctx context.Context) {
 	slog.Info("journey scheduler started",
 		slog.String("id", s.id), slog.Int("batch", s.batch),
 		slog.Duration("lease", s.lease), slog.Duration("max_sleep", s.maxSleep),
+		slog.Bool("fair_claim", s.fair),
 		slog.String("send_gate_stuck_policy", s.stuckPol))
 	for {
 		n, err := s.tick(ctx)
@@ -114,7 +118,11 @@ func (s *Scheduler) Run(ctx context.Context) {
 }
 
 func (s *Scheduler) tick(ctx context.Context) (int, error) {
-	runs, err := s.claim(ctx)
+	claim := s.claim
+	if s.fair {
+		claim = s.claimFair
+	}
+	runs, err := claim(ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -133,23 +141,106 @@ func (s *Scheduler) tick(ctx context.Context) (int, error) {
 //
 // Reclaim is folded into the same query: a run left 'running' by a dead
 // scheduler is due again once its lease expires.
+//
+// BM-131 — the claim is FAIR across workspaces. A plain `ORDER BY wake_at
+// LIMIT n` lets one tenant's backlog of overdue runs fill every batch
+// indefinitely: 10k overdue runs in workspace A means workspace B's single due
+// run never gets claimed, no matter how long it waits. So the batch is divided
+// between the workspaces that currently have due work, and the starting
+// workspace rotates each tick so none is systematically first.
+func (s *Scheduler) claimFair(ctx context.Context) ([]Run, error) {
+	wss, err := s.dueWorkspaces(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(wss) == 0 {
+		return nil, nil
+	}
+	// Rotate the starting point so the same workspace isn't always served
+	// first when the batch doesn't divide evenly.
+	s.tickN++
+	off := s.tickN % len(wss)
+
+	per := s.batch / len(wss)
+	if per < 1 {
+		per = 1
+	}
+	var out []Run
+	for i := 0; i < len(wss) && len(out) < s.batch; i++ {
+		ws := wss[(off+i)%len(wss)]
+		room := s.batch - len(out)
+		if per < room {
+			room = per
+		}
+		runs, err := s.claimWorkspace(ctx, ws, room)
+		if err != nil {
+			return out, err
+		}
+		out = append(out, runs...)
+	}
+	return out, nil
+}
+
+// dueWorkspaces lists workspaces with at least one due run. One indexed query
+// per tick, served by idx_runs_due.
+func (s *Scheduler) dueWorkspaces(ctx context.Context) ([]string, error) {
+	const q = `
+		SELECT DISTINCT workspace_id
+		FROM journey_runs
+		WHERE (status IN ('ready','waiting') AND (wake_at IS NULL OR wake_at <= NOW()))
+		   OR (status = 'running' AND claim_expires_at IS NOT NULL AND claim_expires_at <= NOW())
+	`
+	rows, err := s.db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("due workspaces: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var ws string
+		if err := rows.Scan(&ws); err != nil {
+			return nil, err
+		}
+		out = append(out, ws)
+	}
+	return out, rows.Err()
+}
+
+func (s *Scheduler) claimWorkspace(ctx context.Context, workspaceID string, limit int) ([]Run, error) {
+	return s.claimWhere(ctx, workspaceID, limit)
+}
+
 func (s *Scheduler) claim(ctx context.Context) ([]Run, error) {
+	return s.claimWhere(ctx, "", s.batch)
+}
+
+// claimWhere is the shared claim body. An empty workspaceID claims across all
+// workspaces (the unfair path, kept for the A/B).
+func (s *Scheduler) claimWhere(ctx context.Context, workspaceID string, limit int) ([]Run, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin claim: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	const sel = `
+	sel := `
 		SELECT workspace_id, run_id, journey_id, journey_version, person_id, step_index, attempt
 		FROM journey_runs
-		WHERE (status IN ('ready','waiting') AND (wake_at IS NULL OR wake_at <= NOW()))
-		   OR (status = 'running' AND claim_expires_at IS NOT NULL AND claim_expires_at <= NOW())
+		WHERE ((status IN ('ready','waiting') AND (wake_at IS NULL OR wake_at <= NOW()))
+		   OR (status = 'running' AND claim_expires_at IS NOT NULL AND claim_expires_at <= NOW()))
+	`
+	args := []any{}
+	if workspaceID != "" {
+		sel += ` AND workspace_id = ?`
+		args = append(args, workspaceID)
+	}
+	sel += `
 		ORDER BY wake_at IS NOT NULL, wake_at
 		LIMIT ?
 		FOR UPDATE SKIP LOCKED
 	`
-	rows, err := tx.QueryContext(ctx, sel, s.batch)
+	args = append(args, limit)
+	rows, err := tx.QueryContext(ctx, sel, args...)
 	if err != nil {
 		return nil, fmt.Errorf("select due runs: %w", err)
 	}
@@ -258,7 +349,8 @@ func (s *Scheduler) executeRun(ctx context.Context, r *Run) {
 			s.advance(ctx, r, r.StepIndex+1, time.Now().UTC().Add(time.Duration(step.Seconds)*time.Second))
 		}
 		s.steps.Add(ctx, 1, metric.WithAttributes(
-			attribute.String("type", StepDelay), attribute.String("outcome", "scheduled")))
+			attribute.String("type", StepDelay), attribute.String("outcome", "scheduled"),
+			attribute.String("workspace_id", r.WorkspaceID)))
 
 	case StepBranch:
 		per, err := person.Get(ctx, s.db, r.WorkspaceID, r.PersonID)
@@ -280,7 +372,8 @@ func (s *Scheduler) executeRun(ctx context.Context, r *Run) {
 			slog.String("run_id", r.RunID), slog.String("taken", taken), slog.Int("next", next))
 		s.advance(ctx, r, next, time.Time{})
 		s.steps.Add(ctx, 1, metric.WithAttributes(
-			attribute.String("type", StepBranch), attribute.String("outcome", taken)))
+			attribute.String("type", StepBranch), attribute.String("outcome", taken),
+			attribute.String("workspace_id", r.WorkspaceID)))
 
 	case StepSend:
 		s.executeSend(ctx, r, j, step)
@@ -365,7 +458,8 @@ func (s *Scheduler) executeSend(ctx context.Context, r *Run, j *Journey, step *S
 			slog.String("run_id", r.RunID), slog.String("idem_key", key), slog.Any("error", err))
 	}
 	s.steps.Add(ctx, 1, metric.WithAttributes(
-		attribute.String("type", StepSend), attribute.String("outcome", "sent")))
+		attribute.String("type", StepSend), attribute.String("outcome", "sent"),
+		attribute.String("workspace_id", r.WorkspaceID)))
 	slog.InfoContext(ctx, "journey step sent",
 		slog.String("run_id", r.RunID), slog.String("journey_id", r.JourneyID),
 		slog.String("person_id", r.PersonID), slog.Int("step_index", r.StepIndex))

@@ -4,7 +4,7 @@ COMPOSE ?= docker compose
 
 .PHONY: help up down logs ps rebuild test fmt vet seed seed-people seed-segments seed-campaign showcase \
 	load load-prep load-quick load-soak seed-journey journey-runs \
-	dlq-inspect dlq-replay dlq-purge retry-queues \
+	dlq-inspect dlq-replay dlq-purge retry-queues noisy-prep noisy-neighbour \
 	mysql events-count people-count segments-count campaigns-count enrollments-count
 
 help:
@@ -100,6 +100,20 @@ seed-journey: ## V3-1a: define a journey, fire a trigger, then REDELIVER it — 
 	  sleep 4
 	@echo "6. run count for onboard_pro (BM-113 — expect exactly 1):"
 	@$(MAKE) -s journey-runs
+
+noisy-prep: ## V3-3: create ws_noisy + ws_quiet with a campaign each, then restart the worker
+	@$(COMPOSE) exec -T mysql mysql -ubm -pbm bm -e \
+	  "INSERT IGNORE INTO workspaces (workspace_id, name) VALUES ('ws_noisy','Noisy tenant'),('ws_quiet','Quiet tenant');"
+	@for ws in ws_noisy ws_quiet; do \
+	  curl -fsS -X POST http://localhost:8090/campaigns -H "X-Workspace-ID: $$ws" -H 'Content-Type: application/json' \
+	    -d '{"campaign_id":"welcome","name":"Welcome","trigger":{"op":"event_seen","name":"signed_up"},"template":"hi {{.Person.PersonID}}"}' \
+	    >/dev/null 2>&1 && echo "  $$ws campaign ready" || echo "  $$ws campaign already exists"; \
+	done
+	@echo "  restarting worker so it subscribes to the new workspaces"
+	@$(COMPOSE) restart campaign-worker >/dev/null 2>&1 && sleep 8 && echo "  ready"
+
+noisy-neighbour: ## V3-3: prove tenant isolation — one workspace floods, the other must stay served (BM-133)
+	@./chaos/noisy-neighbour.sh
 
 dlq-inspect: ## V3-2: DLQ depth + why each message gave up (BM-124)
 	@./chaos/dlq.sh inspect
