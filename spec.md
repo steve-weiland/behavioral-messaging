@@ -451,12 +451,12 @@ here would just create a third copy to keep in sync.
 
 | Slice | Scope | State |
 |---|---|---|
-| V3-1a | Schema + `/journeys` CRUD + run creation on trigger (no scheduler) | ✅ verified — BM‑110..113, evidence in §7 v0.3.1 |
-| V3-1b | `journey-scheduler`: `SKIP LOCKED` claims, leases, all three step types, send-gate | ✅ verified — BM‑115..119, evidence in §7 v0.3.2 |
-| V3-1c | Version-pinning **enforcement** + `PUT /journeys/{id}` | ✅ verified — BM‑114, evidence in §7 v0.3.9 |
-| V3-2 | Retry ladder + operable DLQ + alerts | ✅ verified — BM‑120..126, evidence in §7 v0.3.3 |
-| V3-3 | Fair scheduler claim · per-workspace admission caps | ⚠️ **split verdict.** Fair claim shipped and kept (BM‑131) — a plain `ORDER BY wake_at LIMIT n` really did let one tenant starve the rest. Admission caps **built, measured, and deleted**: unnecessary for fairness (BM‑133) and a 7× throughput loss as aggregate protection (BM‑135). Evidence in §7 v0.3.4–0.3.6 |
-| V3-x | Ceiling re-measure | ✅ measured — BM‑140, evidence in §7 v0.3.8–0.3.9. Exposed sequential step execution as the real constraint; bounded concurrency took end-to-end 42 → 503 runs/s, and the final cost of the tier is **1.9×**, not the predicted 3–5× |
+| V3‑1a | Schema + `/journeys` CRUD + run creation on trigger (no scheduler) | ✅ verified — BM‑110..113, evidence in §7 v0.3.1 |
+| V3‑1b | `journey-scheduler`: `SKIP LOCKED` claims, leases, all three step types, send-gate | ✅ verified — BM‑115..119, evidence in §7 v0.3.2 |
+| V3‑1c | Version-pinning **enforcement** + `PUT /journeys/{id}` | ✅ verified — BM‑114, evidence in §7 v0.3.9 |
+| V3‑2 | Retry ladder + operable DLQ + alerts | ✅ verified — BM‑120..126, evidence in §7 v0.3.3 |
+| V3‑3 | Fair scheduler claim · per-workspace admission caps | ⚠️ **split verdict.** Fair claim shipped and kept (BM‑131) — a plain `ORDER BY wake_at LIMIT n` really did let one tenant starve the rest. Admission caps **built, measured, and deleted**: unnecessary for fairness (BM‑133) and a 7× throughput loss as aggregate protection (BM‑135). Evidence in §7 v0.3.4–0.3.6 |
+| V3‑x | Ceiling re-measure | ✅ measured — BM‑140, evidence in §7 v0.3.8–0.3.9. Exposed sequential step execution as the real constraint; bounded concurrency took end-to-end 42 → 503 runs/s, and the final cost of the tier is **1.9×**, not the predicted 3–5× |
 
 Note V3-3 and V3-x are where this tier earned its keep, and neither went to
 plan: one slice was half-deleted after measurement contradicted its premise, and
@@ -722,11 +722,11 @@ bottleneck-migration narrative with hardware-pinned numbers.
 | Tier | Mechanism added | Observed ceiling on this hardware | New bottleneck |
 |---|---|---|---|
 | V1 | Track API + MySQL + in-process channel + scan segment eval + stub HTTP dispatch | Intake ~568/s; fan-out **~196/s** (~69% dropped) | Single Dispatcher consumer goroutine — 4 serial MySQL hops + 1 sync HTTP per event |
-| V2-1 | RabbitMQ durable fan-out + `campaign-worker` (manual ack, `PREFETCH` concurrency) | Fan-out **~2,800/s**, zero loss (~14× V1) | Per-event MySQL work (`ListByWorkspace` + `people.Get` + enrollment `INSERT`) over the then-default 25-conn pool on the single shared MySQL |
-| V2-2 | Roaring bitmaps (`segment-worker` serves `/check`) + campaign/attribute caches remove the per-event MySQL reads from the fan-out hot path | Worker stops being the constraint: backlog **9,134 → 83**, worker CPU 224% → 145%. Intake flat at **~2,700/s** under doubled concurrency | **Shared single MySQL write throughput** — one event `INSERT` + one enrollment `INSERT` per event, MySQL pinned ~306% while worker (145%) and track-api (130%) have headroom |
-| V2-2x | MySQL pool default 25 → 50 (PR 12) | Intake **2,173 → 2,836/s**, p99 **306 → 197 ms** going 25 → 64 conns | Still MySQL writes — the pool was throttling *access* to the bottleneck, not the bottleneck itself |
-| V2-3 | Batched idempotent enrollment (multi-row commit per flush + UNIQUE natural key) | Write side keeps pace: peak backlog **166** batched vs **156,961** unbatched; ~63.5 rows/flush; 0 duplicate enrollments across 700k+ rows | Still the shared MySQL, now on the event-`INSERT` (intake) side — the fan-out write is amortized. Next levers: read/write split, or shard (V3/V4) |
-| V3 | Journey FSM (persisted runs + `SKIP LOCKED` scheduler) + retry ladder/DLQ + per-workspace capacity caps | *(designed, not built)* — **predicted: 3–5× LOWER than V2**, ~10 writes per enrolled person vs 2 | Predicted: still MySQL writes, mix shifted from intake to FSM state transitions. **This is the one tier that trades throughput for correctness rather than raising the ceiling** (§3.3) |
+| V2‑1 | RabbitMQ durable fan-out + `campaign-worker` (manual ack, `PREFETCH` concurrency) | Fan-out **~2,800/s**, zero loss (~14× V1) | Per-event MySQL work (`ListByWorkspace` + `people.Get` + enrollment `INSERT`) over the then-default 25-conn pool on the single shared MySQL |
+| V2‑2 | Roaring bitmaps (`segment-worker` serves `/check`) + campaign/attribute caches remove the per-event MySQL reads from the fan-out hot path | Worker stops being the constraint: backlog **9,134 → 83**, worker CPU 224% → 145%. Intake flat at **~2,700/s** under doubled concurrency | **Shared single MySQL write throughput** — one event `INSERT` + one enrollment `INSERT` per event, MySQL pinned ~306% while worker (145%) and track-api (130%) have headroom |
+| V2‑2x | MySQL pool default 25 → 50 (PR 12) | Intake **2,173 → 2,836/s**, p99 **306 → 197 ms** going 25 → 64 conns | Still MySQL writes — the pool was throttling *access* to the bottleneck, not the bottleneck itself |
+| V2‑3 | Batched idempotent enrollment (multi-row commit per flush + UNIQUE natural key) | Write side keeps pace: peak backlog **166** batched vs **156,961** unbatched; ~63.5 rows/flush; 0 duplicate enrollments across 700k+ rows | Still the shared MySQL, now on the event-`INSERT` (intake) side — the fan-out write is amortized. Next levers: read/write split, or shard (V3/V4) |
+| V3 | Journey FSM (persisted runs + `SKIP LOCKED` scheduler + leases + version pinning) + retry ladder/DLQ + fair claim | Fan-out **956 → 762 events/s**; end-to-end **503 runs/s** — a **1.9× reduction**, against 3–5× predicted | **Not established.** The apparent ceiling was the scheduler executing claimed batches *sequentially* (42 runs/s); bounded concurrency gave 12×, and neither arm was then driven to saturation. MySQL was never shown to be the constraint, so Q17 stays premature. Per-workspace capacity caps were built, measured, and **deleted** (BM‑130/133/135) |
 
 ---
 
