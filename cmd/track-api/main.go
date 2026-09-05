@@ -112,6 +112,10 @@ func main() {
 		log.Fatalf("amqp people-feed channel: %v", err)
 	}
 	defer peopleCh.Close()
+	// A dead broker link must not leave a zombie publisher behind a green
+	// /healthz — exit and let the restart policy reconnect (BM review #5).
+	amqpx.ExitOnClose(amqpConn, amqpCh, serviceName)
+	amqpx.ExitOnClose(amqpConn, peopleCh, serviceName)
 	peopleFeed, err := peoplefeed.NewPublisher(peopleCh)
 	if err != nil {
 		log.Fatalf("people feed: %v", err)

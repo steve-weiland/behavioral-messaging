@@ -126,6 +126,7 @@ services:
       - loki
 
   track-api:
+    restart: unless-stopped
     build:
       context: .
       dockerfile: Dockerfile
@@ -153,6 +154,7 @@ services:
         condition: service_started
 
   stub-receiver:
+    restart: unless-stopped
     build:
       context: .
       dockerfile: Dockerfile
@@ -173,6 +175,7 @@ services:
   # Multiple replicas are safe (competing-consumer pattern) but we
   # don't run them yet — V2-1c measures the ceiling first.
   campaign-worker:
+    restart: unless-stopped
     build:
       context: .
       dockerfile: Dockerfile
@@ -215,6 +218,7 @@ services:
   # holds a lease per claim (so a crash mid-step is reclaimable), and gates
   # every send on idempotency_keys (so reclaim can't double-send).
   journey-scheduler:
+    restart: unless-stopped
     build:
       context: .
       dockerfile: Dockerfile
@@ -252,6 +256,7 @@ services:
   # (campaigns.fanout) + the people.changes feed. Serves membership over
   # HTTP so track-api's /segments/{id}/check no longer scans MySQL.
   segment-worker:
+    restart: unless-stopped
     build:
       context: .
       dockerfile: Dockerfile

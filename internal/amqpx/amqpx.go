@@ -17,6 +17,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"sync"
 	"time"
 
@@ -94,6 +95,37 @@ func initMetrics() {
 			panic(fmt.Errorf("amqpx requeue counter: %w", err))
 		}
 	})
+}
+
+// ExitOnClose watches for ABNORMAL closure of the connection or channel and
+// exits the process. Without this, a channel-level error (a failed declare, a
+// broker restart) silently closes every Consume's deliveries loop: the
+// process keeps running, /healthz stays green, and nothing consumes — a
+// zombie. Crash-fast + the compose restart policy turns that into a clean
+// reconnect-and-resubscribe cycle. Graceful Close delivers nil on the notify
+// channels, which is ignored, so normal shutdown is unaffected.
+func ExitOnClose(conn *amqp.Connection, ch *amqp.Channel, service string) {
+	connErrs := conn.NotifyClose(make(chan *amqp.Error, 1))
+	chanErrs := ch.NotifyClose(make(chan *amqp.Error, 1))
+	go func() {
+		if abnormalClose(connErrs, chanErrs) {
+			slog.Error("AMQP connection/channel closed abnormally — exiting for restart",
+				slog.String("service", service))
+			os.Exit(1)
+		}
+	}()
+}
+
+// abnormalClose blocks until either notify channel yields, and reports
+// whether the closure carried an error (true = broker/channel fault; false =
+// graceful Close, which delivers nil / closes the channel).
+func abnormalClose(a, b <-chan *amqp.Error) bool {
+	select {
+	case err := <-a:
+		return err != nil
+	case err := <-b:
+		return err != nil
+	}
 }
 
 // Connect opens an AMQP connection and a single channel.

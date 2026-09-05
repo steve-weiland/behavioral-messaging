@@ -94,6 +94,9 @@ func main() {
 	if err := campaign.DeclareProducerTopology(amqpCh); err != nil {
 		log.Fatalf("declare campaigns topology: %v", err)
 	}
+	// Zombie-consumer guard: a channel error ends every delivery loop
+	// silently; exit and let the restart policy resubscribe (BM review #5).
+	amqpx.ExitOnClose(amqpConn, amqpCh, serviceName)
 
 	prefetch := envInt("PREFETCH", 32)
 

@@ -112,6 +112,11 @@ func main() {
 	if err := campaign.DeclareRetryTopology(amqpCh); err != nil {
 		log.Fatalf("amqp retry topology: %v", err)
 	}
+	// Every consumer, the attr feed, and the retrier share this one channel —
+	// a single channel-level error would silently end all of their delivery
+	// loops while /healthz stayed green. Crash-fast instead; the compose
+	// restart policy reconnects and resubscribes (BM review #5).
+	amqpx.ExitOnClose(amqpConn, amqpCh, serviceName)
 
 	// V2-2c hot path. Default "cache": serve per-event campaign list +
 	// person attributes from in-process caches (no MySQL read per event).
