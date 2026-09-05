@@ -129,12 +129,12 @@
       "id": 6,
       "type": "timeseries",
       "title": "DLQ depth by queue (V2 PR 4)",
-      "description": "F5 — poison messages now land in *.dlq instead of vanishing. Pulls rabbitmq_queue_messages from RabbitMQ's built-in prometheus plugin.",
+      "description": "BM-121/124 — messages that exhausted the retry ladder (or failed terminally) land here instead of vanishing. From the /metrics/detailed scrape.",
       "datasource": {"type": "prometheus", "uid": "prometheus"},
       "targets": [
         {
           "refId": "A",
-          "expr": "rabbitmq_queue_messages{queue=~\".*\\\\.dlq\"}",
+          "expr": "rabbitmq_detailed_queue_messages{queue=\"campaigns.fanout.dlq\"}",
           "legendFormat": "{{queue}}"
         }
       ],
@@ -145,13 +145,13 @@
       "id": 7,
       "type": "timeseries",
       "title": "Source queue depth (backlog)",
-      "description": "Working queues; should hover near zero when consumers keep up. Pulls rabbitmq_queue_messages from the prometheus plugin.",
+      "description": "Per-workspace fan-out backlog (BM-82); should hover near zero when the worker keeps up. workspace_id is relabeled out of the queue name.",
       "datasource": {"type": "prometheus", "uid": "prometheus"},
       "targets": [
         {
           "refId": "A",
-          "expr": "rabbitmq_queue_messages{queue=~\"raw-events|enriched-events\"}",
-          "legendFormat": "{{queue}}"
+          "expr": "rabbitmq_detailed_queue_messages_ready{workspace_id!=\"\"}",
+          "legendFormat": "{{workspace_id}}"
         }
       ],
       "fieldConfig": {"defaults": {"unit": "short", "min": 0}},

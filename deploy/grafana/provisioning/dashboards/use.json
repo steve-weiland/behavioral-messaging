@@ -41,7 +41,7 @@
       "description": "Saturation: messages waiting across all queues. A climbing line means producers outpace consumers.",
       "datasource": {"type": "prometheus", "uid": "prometheus"},
       "targets": [
-        {"refId": "A", "expr": "sum(rabbitmq_queue_messages)", "legendFormat": "all queues"}
+        {"refId": "A", "expr": "sum(rabbitmq_detailed_queue_messages)", "legendFormat": "all queues"}
       ],
       "fieldConfig": {"defaults": {"unit": "short", "min": 0}},
       "gridPos": {"h": 7, "w": 8, "x": 8, "y": 1}

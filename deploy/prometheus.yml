@@ -28,6 +28,14 @@ scrape_configs:
   #   rate(rabbitmq_detailed_queue_messages_published_total[1m])        → publish rate
   #   rate(rabbitmq_detailed_queue_messages_delivered_total[1m])        → drain rate
   # This is what chaos/watch-fanout.sh had to poll the management API for.
+  # Node-level broker health (connections, channels, disk, memory) only
+  # exists on the aggregated /metrics endpoint — the detailed endpoint
+  # below emits per-queue families only. The USE dashboard's RabbitMQ row
+  # reads these.
+  - job_name: rabbitmq-node
+    static_configs:
+      - targets: ["rabbitmq:15692"]
+
   - job_name: rabbitmq
     metrics_path: /metrics/detailed
     params:
