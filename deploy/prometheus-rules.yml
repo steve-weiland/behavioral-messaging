@@ -39,27 +39,37 @@ groups:
       - record: slo:track_good:rate6h
         expr: sum(rate(http_server_request_duration_seconds_bucket{service_name="track-api",http_route="/events",http_request_method="POST",http_response_status_code=~"2..",le="0.5"}[6h]))
 
-      # Error ratio per window. clamp_min so an empty stack ((0/0=NaN))
-      # evaluates to 0 instead of firing a phantom alert.
+      # Error ratio per window, written as (total − good) / total — NOT the
+      # algebraically-equal-looking 1 − good/total. The two differ exactly at
+      # zero traffic: with flat counters both rates are 0, and 1 − 0/clamp = 1
+      # (100% error ratio — an idle stack pages), while (0 − 0)/clamp = 0.
+      # `good or vector(0)` covers the other absence edge: in a pure-failure
+      # storm with no 2xx series ever scraped, `good` is an empty vector and
+      # the subtraction would record nothing — the page could never fire.
+      # Both edges pinned by deploy/prometheus-rules-test.yml.
       - record: slo:track_error_ratio:5m
-        expr: 1 - (slo:track_good:rate5m / clamp_min(slo:track_total:rate5m, 1e-9))
+        expr: (slo:track_total:rate5m - (slo:track_good:rate5m or vector(0))) / clamp_min(slo:track_total:rate5m, 1e-9)
       - record: slo:track_error_ratio:30m
-        expr: 1 - (slo:track_good:rate30m / clamp_min(slo:track_total:rate30m, 1e-9))
+        expr: (slo:track_total:rate30m - (slo:track_good:rate30m or vector(0))) / clamp_min(slo:track_total:rate30m, 1e-9)
       - record: slo:track_error_ratio:1h
-        expr: 1 - (slo:track_good:rate1h / clamp_min(slo:track_total:rate1h, 1e-9))
+        expr: (slo:track_total:rate1h - (slo:track_good:rate1h or vector(0))) / clamp_min(slo:track_total:rate1h, 1e-9)
       - record: slo:track_error_ratio:6h
-        expr: 1 - (slo:track_good:rate6h / clamp_min(slo:track_total:rate6h, 1e-9))
+        expr: (slo:track_total:rate6h - (slo:track_good:rate6h or vector(0))) / clamp_min(slo:track_total:rate6h, 1e-9)
 
       # Error budget burned over 28d (used by the dashboard stat panel).
       # 1 − ((1 − error_ratio_28d) / SLO_target) where SLO_target = 0.99.
       # Simplifies to error_ratio_28d / (1 − SLO_target) = error_ratio_28d / 0.01.
       - record: slo:track_budget_burn_pct:28d
         expr: |
-          (1 - (
-            sum(rate(http_server_request_duration_seconds_bucket{service_name="track-api",http_route="/events",http_request_method="POST",http_response_status_code=~"2..",le="0.5"}[28d]))
+          (
+            (
+              sum(rate(http_server_request_duration_seconds_count{service_name="track-api",http_route="/events",http_request_method="POST"}[28d]))
+              -
+              (sum(rate(http_server_request_duration_seconds_bucket{service_name="track-api",http_route="/events",http_request_method="POST",http_response_status_code=~"2..",le="0.5"}[28d])) or vector(0))
+            )
             /
             clamp_min(sum(rate(http_server_request_duration_seconds_count{service_name="track-api",http_route="/events",http_request_method="POST"}[28d])), 1e-9)
-          )) / 0.01
+          ) / 0.01
 
   - name: slo-alerts
     rules:

@@ -10,7 +10,7 @@ BM133_WS       ?= 6
 BM133_TOTAL    ?= 12
 BM133_DURATION ?= 30
 
-.PHONY: help up down logs ps rebuild test fmt vet seed seed-people seed-segments seed-campaign showcase \
+.PHONY: help up down logs ps rebuild test rules-test fmt vet seed seed-people seed-segments seed-campaign showcase \
 	load load-prep load-quick load-soak seed-journey journey-runs \
 	dlq-inspect dlq-replay dlq-purge retry-queues noisy-prep noisy-neighbour bm133 \
 	mysql events-count people-count segments-count campaigns-count enrollments-count
@@ -35,6 +35,10 @@ rebuild: ## Rebuild + restart Go services only
 
 test: ## Run all Go unit tests (no docker required)
 	go test ./...
+
+rules-test: ## promtool unit tests for the SLO recording + alert rules (docker)
+	@docker run --rm -v $(PWD)/deploy:/deploy:ro --entrypoint /bin/promtool \
+		prom/prometheus:v3.11.3 test rules /deploy/prometheus-rules-test.yml
 
 fmt: ## gofmt the tree
 	gofmt -w cmd/ internal/

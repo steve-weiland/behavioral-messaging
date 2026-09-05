@@ -1,0 +1,73 @@
+# promtool unit tests for prometheus-rules.yml — run via `make rules-test`.
+#
+# Pins the zero-traffic behavior of the SLO rules: an IDLE stack (counters
+# present but flat, which is what the collector exports between demos) must
+# read as 0% error ratio and MUST NOT page. The 1 − good/total form of the
+# ratio got this wrong (0/clamp → 1 − 0 = 1 → phantom page after an idle
+# hour); the (total − good)/total form these tests pin evaluates to 0.
+rule_files:
+  - prometheus-rules.yml
+
+evaluation_interval: 30s
+
+tests:
+  # ── Idle stack: flat counters for 80 min ─────────────────────────────
+  - interval: 30s
+    input_series:
+      - series: 'http_server_request_duration_seconds_count{service_name="track-api",http_route="/events",http_request_method="POST",http_response_status_code="202"}'
+        values: "100x160"
+      - series: 'http_server_request_duration_seconds_bucket{service_name="track-api",http_route="/events",http_request_method="POST",http_response_status_code="202",le="0.5"}'
+        values: "100x160"
+    promql_expr_test:
+      - expr: slo:track_error_ratio:5m
+        eval_time: 70m
+        exp_samples:
+          - labels: 'slo:track_error_ratio:5m'
+            value: 0
+      - expr: slo:track_error_ratio:1h
+        eval_time: 70m
+        exp_samples:
+          - labels: 'slo:track_error_ratio:1h'
+            value: 0
+      - expr: slo:track_budget_burn_pct:28d
+        eval_time: 70m
+        exp_samples:
+          - labels: 'slo:track_budget_burn_pct:28d'
+            value: 0
+    alert_rule_test:
+      # The regression this file exists for: no traffic must not page.
+      - alertname: TrackBurnRatePage
+        eval_time: 70m
+        exp_alerts: []
+      - alertname: TrackBurnRateTicket
+        eval_time: 70m
+        exp_alerts: []
+
+  # ── Cold-start failure storm: requests flow, every one is 5xx, and no
+  # 2xx series has ever been scraped. The `good` recording rule is an empty
+  # vector here — without `or vector(0)` the ratio records nothing and the
+  # page can never fire. Ratio must read 1; the fast-burn page must fire
+  # once both windows exceed 14.4×.
+  - interval: 30s
+    input_series:
+      - series: 'http_server_request_duration_seconds_count{service_name="track-api",http_route="/events",http_request_method="POST",http_response_status_code="500"}'
+        values: "0+10x160"
+      - series: 'http_server_request_duration_seconds_bucket{service_name="track-api",http_route="/events",http_request_method="POST",http_response_status_code="500",le="0.5"}'
+        values: "0x160"
+    promql_expr_test:
+      - expr: slo:track_error_ratio:5m
+        eval_time: 70m
+        exp_samples:
+          - labels: 'slo:track_error_ratio:5m'
+            value: 1
+    alert_rule_test:
+      - alertname: TrackBurnRatePage
+        eval_time: 70m
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              slo: track-api-availability
+            exp_annotations:
+              summary: "Fast burn — POST /events SLO budget exhausting in <2d"
+              description: "Error ratio over 1h and 5m windows both exceed 14.4× the steady-state burn that would deplete the 28d error budget."
+              runbook_url: "https://github.com/steveweiland/behavioral-messaging/blob/main/RUNBOOK.md#burn-rate-page"
