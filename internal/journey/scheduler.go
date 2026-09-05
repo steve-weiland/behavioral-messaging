@@ -59,6 +59,7 @@ type Scheduler struct {
 	steps     metric.Int64Counter
 	claims    metric.Int64Histogram
 	gateSkips metric.Int64Counter
+	leaseLost metric.Int64Counter
 }
 
 // SchedulerConfig holds the knobs. Every one is env-driven in main.
@@ -102,11 +103,16 @@ func NewScheduler(db *sql.DB, hc *http.Client, cfg SchedulerConfig) *Scheduler {
 	if err != nil {
 		panic(err)
 	}
+	leaseLost, err := m.Int64Counter("journey_lease_lost_total",
+		metric.WithDescription("Transitions discarded because the run was reclaimed while this replica held a stale lease. Labels: verb."))
+	if err != nil {
+		panic(err)
+	}
 	return &Scheduler{
 		db: db, id: cfg.ID, stubURL: cfg.StubURL, hc: hc,
 		batch: cfg.Batch, concurrency: cfg.Concurrency, fair: cfg.Fair, lease: cfg.Lease, maxSleep: cfg.MaxSleep,
 		stuckPol: cfg.StuckPolicy, stuckAfter: cfg.StuckAfter,
-		steps: steps, claims: claims, gateSkips: skips,
+		steps: steps, claims: claims, gateSkips: skips, leaseLost: leaseLost,
 	}
 }
 
@@ -633,6 +639,38 @@ func (s *Scheduler) post(ctx context.Context, body []byte) error {
 
 // --- state transitions ---
 
+// casTransition runs a lease-guarded state transition: the WHERE clause is
+// the compare (this replica still holds the run, still 'running'), rows-
+// affected is the verdict. false = the lease expired and another replica
+// reclaimed the run while this one stalled — the stale writer's transition
+// is discarded and it must stop touching the run (BM-141). Without the
+// guard, a late advance/release could rewind step_index, zero the attempt
+// counter, or flip status under the legitimate holder.
+func (s *Scheduler) casTransition(ctx context.Context, r *Run, verb, q string, args ...any) bool {
+	res, err := s.db.ExecContext(ctx, q, args...)
+	if err != nil {
+		slog.ErrorContext(ctx, verb+" failed — run keeps its lease and will be reclaimed",
+			slog.String("run_id", r.RunID), slog.Any("error", err))
+		return false
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		slog.ErrorContext(ctx, verb+": rows-affected unreadable", slog.Any("error", err))
+		return false
+	}
+	if n == 0 {
+		s.leaseLost.Add(ctx, 1, metric.WithAttributes(attribute.String("verb", verb)))
+		slog.WarnContext(ctx, "lease lost — transition discarded (run was reclaimed)",
+			slog.String("verb", verb), slog.String("run_id", r.RunID),
+			slog.String("claimed_by", s.id))
+		return false
+	}
+	return true
+}
+
+// leaseGuard is the shared compare half of every transition.
+const leaseGuard = ` AND claimed_by = ? AND status = 'running'`
+
 // advance moves to nextStep. A zero wakeAt means immediately due.
 func (s *Scheduler) advance(ctx context.Context, r *Run, nextStep int, wakeAt time.Time) {
 	status, wake := StatusReady, any(nil)
@@ -643,12 +681,8 @@ func (s *Scheduler) advance(ctx context.Context, r *Run, nextStep int, wakeAt ti
 		UPDATE journey_runs
 		SET step_index = ?, status = ?, wake_at = ?, attempt = 0, last_error = NULL,
 		    claimed_by = NULL, claim_expires_at = NULL
-		WHERE workspace_id = ? AND run_id = ?
-	`
-	if _, err := s.db.ExecContext(ctx, q, nextStep, status, wake, r.WorkspaceID, r.RunID); err != nil {
-		slog.ErrorContext(ctx, "advance failed — run keeps its lease and will be reclaimed",
-			slog.String("run_id", r.RunID), slog.Any("error", err))
-	}
+		WHERE workspace_id = ? AND run_id = ?` + leaseGuard
+	s.casTransition(ctx, r, "advance", q, nextStep, status, wake, r.WorkspaceID, r.RunID, s.id)
 }
 
 // finish marks a run done (fell off the end of the step list).
@@ -656,10 +690,8 @@ func (s *Scheduler) finish(ctx context.Context, r *Run) {
 	const q = `
 		UPDATE journey_runs SET status = 'done', wake_at = NULL,
 		    claimed_by = NULL, claim_expires_at = NULL
-		WHERE workspace_id = ? AND run_id = ?
-	`
-	if _, err := s.db.ExecContext(ctx, q, r.WorkspaceID, r.RunID); err != nil {
-		slog.ErrorContext(ctx, "finish failed", slog.String("run_id", r.RunID), slog.Any("error", err))
+		WHERE workspace_id = ? AND run_id = ?` + leaseGuard
+	if !s.casTransition(ctx, r, "finish", q, r.WorkspaceID, r.RunID, s.id) {
 		return
 	}
 	slog.InfoContext(ctx, "journey run done",
@@ -673,10 +705,9 @@ func (s *Scheduler) fail(ctx context.Context, r *Run, reason string) {
 	const q = `
 		UPDATE journey_runs SET status = 'failed', last_error = ?, wake_at = NULL,
 		    claimed_by = NULL, claim_expires_at = NULL
-		WHERE workspace_id = ? AND run_id = ?
-	`
-	if _, err := s.db.ExecContext(ctx, q, truncate(reason, 500), r.WorkspaceID, r.RunID); err != nil {
-		slog.ErrorContext(ctx, "fail update failed", slog.String("run_id", r.RunID), slog.Any("error", err))
+		WHERE workspace_id = ? AND run_id = ?` + leaseGuard
+	if !s.casTransition(ctx, r, "fail", q, truncate(reason, 500), r.WorkspaceID, r.RunID, s.id) {
+		return
 	}
 	slog.ErrorContext(ctx, "journey run failed",
 		slog.String("run_id", r.RunID), slog.String("reason", reason))
@@ -705,11 +736,10 @@ func (s *Scheduler) release(ctx context.Context, r *Run, reason string) {
 		SET status = 'ready', attempt = attempt + 1, last_error = ?,
 		    wake_at = DATE_ADD(NOW(), INTERVAL ? SECOND),
 		    claimed_by = NULL, claim_expires_at = NULL
-		WHERE workspace_id = ? AND run_id = ?
-	`
-	if _, err := s.db.ExecContext(ctx, q, truncate(reason, 500), int(delay.Seconds()),
-		r.WorkspaceID, r.RunID); err != nil {
-		slog.ErrorContext(ctx, "release failed", slog.String("run_id", r.RunID), slog.Any("error", err))
+		WHERE workspace_id = ? AND run_id = ?` + leaseGuard
+	if !s.casTransition(ctx, r, "release", q, truncate(reason, 500), int(delay.Seconds()),
+		r.WorkspaceID, r.RunID, s.id) {
+		return
 	}
 	slog.WarnContext(ctx, "journey run released for retry",
 		slog.String("run_id", r.RunID), slog.String("reason", reason),
