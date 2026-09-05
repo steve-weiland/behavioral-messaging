@@ -186,8 +186,19 @@ func main() {
 	// baseline for showing what bounded retry changed.
 	var retrier *campaign.Retrier
 	if envOr("RETRY_LADDER", "on") != "off" {
-		retrier = campaign.NewRetrier(amqpCh)
-		slog.Info("retry ladder enabled", slog.Int("tiers", len(campaign.RetryLadder)))
+		// Own channel: NewRetrier puts it in confirm mode (channel-wide), and
+		// republish confirms must not contend with consumer ack traffic.
+		retryCh, err := amqpConn.Channel()
+		if err != nil {
+			log.Fatalf("amqp retry channel: %v", err)
+		}
+		defer retryCh.Close()
+		amqpx.ExitOnClose(amqpConn, retryCh, serviceName)
+		retrier, err = campaign.NewRetrier(retryCh)
+		if err != nil {
+			log.Fatalf("retrier: %v", err)
+		}
+		slog.Info("retry ladder enabled (confirmed publishes)", slog.Int("tiers", len(campaign.RetryLadder)))
 	} else {
 		slog.Info("retry ladder disabled (immediate requeue — V2 behavior)")
 	}

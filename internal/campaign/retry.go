@@ -27,7 +27,16 @@ type Retrier struct {
 	deadLetter metric.Int64Counter
 }
 
-func NewRetrier(ch *amqp.Channel) *Retrier {
+// NewRetrier puts the channel in confirm mode: every retry/DLQ republish
+// waits for the broker's ack before the caller may ack the original
+// delivery. Without confirms, PublishWithContext returns at socket-write —
+// a broker failure at that instant loses the message AFTER the original was
+// acked, which is exactly the loss class the ladder exists to close. Give
+// the retrier its own channel: confirm mode is channel-wide.
+func NewRetrier(ch *amqp.Channel) (*Retrier, error) {
+	if err := ch.Confirm(false); err != nil {
+		return nil, fmt.Errorf("confirm mode: %w", err)
+	}
 	m := otel.Meter("campaigns")
 	retried, err := m.Int64Counter("campaign_retry_scheduled_total",
 		metric.WithDescription("Deliveries scheduled onto a retry tier. Labels: tier, workspace_id."))
@@ -39,7 +48,7 @@ func NewRetrier(ch *amqp.Channel) *Retrier {
 	if err != nil {
 		panic(err)
 	}
-	return &Retrier{ch: ch, retried: retried, deadLetter: dl}
+	return &Retrier{ch: ch, retried: retried, deadLetter: dl}, nil
 }
 
 // Attempt reads the attempt count off a delivery. Absent header = first try.
@@ -65,9 +74,10 @@ func Attempt(d amqp.Delivery) int {
 // the tier used. When the ladder is exhausted it dead-letters instead, and
 // reports exhausted=true so the caller can log it as terminal.
 //
-// The caller ACKs the original delivery after this returns nil: the message is
-// durably on the retry queue (persistent, durable queue), so acking is correct
-// — leaving it unacked would double it up on the next redelivery.
+// The caller ACKs the original delivery after this returns nil: the republish
+// is broker-CONFIRMED (persistent message, durable queue, confirm-mode ack
+// awaited), so acking is correct — leaving it unacked would double it up on
+// the next redelivery.
 func (r *Retrier) Retry(ctx context.Context, d amqp.Delivery, workspaceID, reason string) (tier string, exhausted bool, err error) {
 	attempt := Attempt(d)
 	if attempt >= len(RetryLadder) {
@@ -84,12 +94,11 @@ func (r *Retrier) Retry(ctx context.Context, d amqp.Delivery, workspaceID, reaso
 
 	pubCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	if err := r.ch.PublishWithContext(pubCtx, t.Exchange,
+	if err := r.publishConfirmed(pubCtx, t.Exchange,
 		// routing_key is preserved through the fanout and reused by the
 		// dead-letter republish, which is how the message finds its way back
 		// to the right per-workspace queue.
 		workspaceID,
-		false, false,
 		amqp.Publishing{
 			ContentType:  "application/json",
 			DeliveryMode: amqp.Persistent,
@@ -126,7 +135,7 @@ func (r *Retrier) DeadLetter(ctx context.Context, d amqp.Delivery, workspaceID, 
 
 	pubCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	if err := r.ch.PublishWithContext(pubCtx, ExchangeDLX, "", false, false,
+	if err := r.publishConfirmed(pubCtx, ExchangeDLX, "",
 		amqp.Publishing{
 			ContentType:  "application/json",
 			DeliveryMode: amqp.Persistent,
@@ -146,6 +155,25 @@ func (r *Retrier) DeadLetter(ctx context.Context, d amqp.Delivery, workspaceID, 
 		slog.String("cause", cause),
 		slog.Int("attempts", Attempt(d)),
 		slog.String("reason", reason))
+	return nil
+}
+
+// publishConfirmed publishes and waits for the broker's confirm. An error
+// (including a broker nack or timeout) means the message may not be on the
+// queue — the caller must NOT ack the original; makeHandler's fallback
+// requeues it instead.
+func (r *Retrier) publishConfirmed(ctx context.Context, exchange, key string, msg amqp.Publishing) error {
+	dc, err := r.ch.PublishWithDeferredConfirmWithContext(ctx, exchange, key, false, false, msg)
+	if err != nil {
+		return err
+	}
+	acked, err := dc.WaitContext(ctx)
+	if err != nil {
+		return fmt.Errorf("await confirm: %w", err)
+	}
+	if !acked {
+		return fmt.Errorf("broker nacked publish to %s", exchange)
+	}
 	return nil
 }
 
