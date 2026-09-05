@@ -19,8 +19,8 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/steveweiland/behavioral-messaging/internal/person"
-	"github.com/steveweiland/behavioral-messaging/internal/segment"
+	"github.com/steve-weiland/behavioral-messaging/internal/person"
+	"github.com/steve-weiland/behavioral-messaging/internal/segment"
 )
 
 // Scheduler advances journey runs (V3-1b, BM-115..119).

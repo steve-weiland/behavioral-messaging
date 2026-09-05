@@ -70,4 +70,4 @@ tests:
             exp_annotations:
               summary: "Fast burn — POST /events SLO budget exhausting in <2d"
               description: "Error ratio over 1h and 5m windows both exceed 14.4× the steady-state burn that would deplete the 28d error budget."
-              runbook_url: "https://github.com/steveweiland/behavioral-messaging/blob/main/RUNBOOK.md#burn-rate-page"
+              runbook_url: "https://github.com/steve-weiland/behavioral-messaging/blob/main/RUNBOOK.md#burn-rate-page-trackburnratepage"

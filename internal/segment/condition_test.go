@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/steveweiland/behavioral-messaging/internal/event"
-	"github.com/steveweiland/behavioral-messaging/internal/person"
+	"github.com/steve-weiland/behavioral-messaging/internal/event"
+	"github.com/steve-weiland/behavioral-messaging/internal/person"
 )
 
 func cond(b string) Condition {

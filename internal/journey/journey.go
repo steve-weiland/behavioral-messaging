@@ -18,8 +18,8 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/steveweiland/behavioral-messaging/internal/campaign"
-	"github.com/steveweiland/behavioral-messaging/internal/segment"
+	"github.com/steve-weiland/behavioral-messaging/internal/campaign"
+	"github.com/steve-weiland/behavioral-messaging/internal/segment"
 )
 
 // Step types (BM-111). Exactly these three.

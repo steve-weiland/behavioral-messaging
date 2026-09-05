@@ -8,7 +8,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
-	"github.com/steveweiland/behavioral-messaging/internal/event"
+	"github.com/steve-weiland/behavioral-messaging/internal/event"
 )
 
 // The producer's whole reason for existing is BM-89: never block the HTTP

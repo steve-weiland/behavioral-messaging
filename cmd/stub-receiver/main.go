@@ -24,8 +24,8 @@ import (
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
-	"github.com/steveweiland/behavioral-messaging/internal/logsx"
-	"github.com/steveweiland/behavioral-messaging/internal/otelinit"
+	"github.com/steve-weiland/behavioral-messaging/internal/logsx"
+	"github.com/steve-weiland/behavioral-messaging/internal/otelinit"
 )
 
 const serviceName = "stub-receiver"

@@ -87,7 +87,7 @@ groups:
         annotations:
           summary: "Fast burn — POST /events SLO budget exhausting in <2d"
           description: "Error ratio over 1h and 5m windows both exceed 14.4× the steady-state burn that would deplete the 28d error budget."
-          runbook_url: "https://github.com/steveweiland/behavioral-messaging/blob/main/RUNBOOK.md#burn-rate-page"
+          runbook_url: "https://github.com/steve-weiland/behavioral-messaging/blob/main/RUNBOOK.md#burn-rate-page-trackburnratepage"
 
       # Ticket: slow burn — 6× over 6h AND 30m.
       - alert: TrackBurnRateTicket
@@ -102,7 +102,7 @@ groups:
         annotations:
           summary: "Slow burn — POST /events SLO budget exhausting in <5d"
           description: "Error ratio over 6h and 30m windows both exceed 6× the steady-state burn."
-          runbook_url: "https://github.com/steveweiland/behavioral-messaging/blob/main/RUNBOOK.md#burn-rate-ticket"
+          runbook_url: "https://github.com/steve-weiland/behavioral-messaging/blob/main/RUNBOOK.md#burn-rate-ticket-trackburnrateticket"
 
   # V3-2 (BM-125): the two failure shapes need separate alerts, because
   # neither one is visible in the other's signal.

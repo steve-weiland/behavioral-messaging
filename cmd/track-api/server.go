@@ -15,13 +15,13 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/steveweiland/behavioral-messaging/internal/campaign"
-	"github.com/steveweiland/behavioral-messaging/internal/event"
-	"github.com/steveweiland/behavioral-messaging/internal/eventstore"
-	"github.com/steveweiland/behavioral-messaging/internal/journey"
-	"github.com/steveweiland/behavioral-messaging/internal/peoplefeed"
-	"github.com/steveweiland/behavioral-messaging/internal/person"
-	"github.com/steveweiland/behavioral-messaging/internal/segment"
+	"github.com/steve-weiland/behavioral-messaging/internal/campaign"
+	"github.com/steve-weiland/behavioral-messaging/internal/event"
+	"github.com/steve-weiland/behavioral-messaging/internal/eventstore"
+	"github.com/steve-weiland/behavioral-messaging/internal/journey"
+	"github.com/steve-weiland/behavioral-messaging/internal/peoplefeed"
+	"github.com/steve-weiland/behavioral-messaging/internal/person"
+	"github.com/steve-weiland/behavioral-messaging/internal/segment"
 )
 
 // Body-size caps. Worked out per surface; documented as BM-26 (people),

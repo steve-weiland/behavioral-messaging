@@ -23,7 +23,7 @@ import (
 	_ "github.com/go-sql-driver/mysql" // registers "mysql" sql driver
 	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
 
-	"github.com/steveweiland/behavioral-messaging/internal/event"
+	"github.com/steve-weiland/behavioral-messaging/internal/event"
 )
 
 // Open returns an OTel-instrumented *sql.DB connected to MySQL.

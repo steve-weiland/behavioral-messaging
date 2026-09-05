@@ -6,9 +6,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/steveweiland/behavioral-messaging/internal/event"
-	"github.com/steveweiland/behavioral-messaging/internal/person"
-	"github.com/steveweiland/behavioral-messaging/internal/segment"
+	"github.com/steve-weiland/behavioral-messaging/internal/event"
+	"github.com/steve-weiland/behavioral-messaging/internal/person"
+	"github.com/steve-weiland/behavioral-messaging/internal/segment"
 )
 
 func TestParseTemplate_Reject(t *testing.T) {

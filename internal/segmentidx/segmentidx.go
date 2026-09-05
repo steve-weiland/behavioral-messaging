@@ -33,7 +33,7 @@ import (
 
 	"github.com/RoaringBitmap/roaring/v2"
 
-	"github.com/steveweiland/behavioral-messaging/internal/segment"
+	"github.com/steve-weiland/behavioral-messaging/internal/segment"
 )
 
 // Index holds bitmap state for all workspaces.

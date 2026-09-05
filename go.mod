@@ -1,4 +1,4 @@
-module github.com/steveweiland/behavioral-messaging
+module github.com/steve-weiland/behavioral-messaging
 
 go 1.25.0
 

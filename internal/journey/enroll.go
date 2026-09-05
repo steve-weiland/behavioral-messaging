@@ -11,9 +11,9 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 
-	"github.com/steveweiland/behavioral-messaging/internal/event"
-	"github.com/steveweiland/behavioral-messaging/internal/person"
-	"github.com/steveweiland/behavioral-messaging/internal/segment"
+	"github.com/steve-weiland/behavioral-messaging/internal/event"
+	"github.com/steve-weiland/behavioral-messaging/internal/person"
+	"github.com/steve-weiland/behavioral-messaging/internal/segment"
 )
 
 // Cache is the per-workspace journey list behind a TTL, mirroring

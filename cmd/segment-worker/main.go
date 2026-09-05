@@ -43,16 +43,16 @@ import (
 
 	amqp "github.com/rabbitmq/amqp091-go"
 
-	"github.com/steveweiland/behavioral-messaging/internal/amqpx"
-	"github.com/steveweiland/behavioral-messaging/internal/campaign"
-	"github.com/steveweiland/behavioral-messaging/internal/event"
-	"github.com/steveweiland/behavioral-messaging/internal/eventstore"
-	"github.com/steveweiland/behavioral-messaging/internal/logsx"
-	"github.com/steveweiland/behavioral-messaging/internal/otelinit"
-	"github.com/steveweiland/behavioral-messaging/internal/peoplefeed"
-	"github.com/steveweiland/behavioral-messaging/internal/person"
-	"github.com/steveweiland/behavioral-messaging/internal/segment"
-	"github.com/steveweiland/behavioral-messaging/internal/segmentidx"
+	"github.com/steve-weiland/behavioral-messaging/internal/amqpx"
+	"github.com/steve-weiland/behavioral-messaging/internal/campaign"
+	"github.com/steve-weiland/behavioral-messaging/internal/event"
+	"github.com/steve-weiland/behavioral-messaging/internal/eventstore"
+	"github.com/steve-weiland/behavioral-messaging/internal/logsx"
+	"github.com/steve-weiland/behavioral-messaging/internal/otelinit"
+	"github.com/steve-weiland/behavioral-messaging/internal/peoplefeed"
+	"github.com/steve-weiland/behavioral-messaging/internal/person"
+	"github.com/steve-weiland/behavioral-messaging/internal/segment"
+	"github.com/steve-weiland/behavioral-messaging/internal/segmentidx"
 )
 
 const serviceName = "segment-worker"

@@ -21,7 +21,7 @@ import (
 	"github.com/google/uuid"
 	amqp "github.com/rabbitmq/amqp091-go"
 
-	"github.com/steveweiland/behavioral-messaging/internal/amqpx"
+	"github.com/steve-weiland/behavioral-messaging/internal/amqpx"
 )
 
 // Exchange is a durable fanout — every bound consumer queue gets every

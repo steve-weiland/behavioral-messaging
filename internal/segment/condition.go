@@ -25,8 +25,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/steveweiland/behavioral-messaging/internal/event"
-	"github.com/steveweiland/behavioral-messaging/internal/person"
+	"github.com/steve-weiland/behavioral-messaging/internal/event"
+	"github.com/steve-weiland/behavioral-messaging/internal/person"
 )
 
 const maxConditionDepth = 8

@@ -14,8 +14,8 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/steveweiland/behavioral-messaging/internal/amqpx"
-	"github.com/steveweiland/behavioral-messaging/internal/event"
+	"github.com/steve-weiland/behavioral-messaging/internal/amqpx"
+	"github.com/steve-weiland/behavioral-messaging/internal/event"
 )
 
 // Publisher hands events from the /events HTTP handler off to the

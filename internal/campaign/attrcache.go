@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"sync"
 
-	"github.com/steveweiland/behavioral-messaging/internal/person"
+	"github.com/steve-weiland/behavioral-messaging/internal/person"
 )
 
 // AttrCache is the V2-2c hot-path replacement for the per-event

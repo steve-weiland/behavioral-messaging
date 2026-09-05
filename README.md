@@ -15,6 +15,7 @@ numbers, including the tiers where the measurement contradicted the plan.
 | | |
 |--|--|
 | **Spec** | [`spec.md`](./spec.md) — RFC-2119 V1 + V2 + V3 requirements |
+| **Runbook** | [`RUNBOOK.md`](./RUNBOOK.md) — burn-rate page + ticket, causes ranked by this build's measurements |
 | **Status** | **V1 + V2 + V3 complete** (spec 0.3.11). All three tiers built, measured, and written up — including one mechanism that measurement told us to delete. |
 | **Stack** | Go 1.25 · MySQL 8.0 · RabbitMQ 3.13 · OpenTelemetry SDK + Collector 0.151 · Tempo 2.10 · Prometheus 3.11 · Loki 3.7 · Grafana Alloy v1.16 · Grafana 13.0 · `docker compose` |
 

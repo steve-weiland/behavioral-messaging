@@ -22,7 +22,7 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/steveweiland/behavioral-messaging/internal/segment"
+	"github.com/steve-weiland/behavioral-messaging/internal/segment"
 )
 
 // Campaign is the persisted shape of one campaign definition.
