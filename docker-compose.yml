@@ -16,6 +16,12 @@
 #   Prometheus      :9090
 #   Loki            :3100
 #   Grafana         :3030
+# Project name pinned: Alloy's log discovery keeps only containers whose
+# compose-project label matches "behavioral-messaging" (deploy/alloy.alloy).
+# Unpinned, the label defaults to the checkout directory's name — clone
+# into any other dir and log collection silently goes empty.
+name: behavioral-messaging
+
 services:
   rabbitmq:
     image: rabbitmq:3.13-management
@@ -40,6 +46,9 @@ services:
       - "3307:3306"
     volumes:
       - ./migrations:/docker-entrypoint-initdb.d:ro
+      # Events, people, enrollments, and journey runs survive `make stop`;
+      # `make down` (down -v) is the wipe.
+      - mysql-data:/var/lib/mysql
     command:
       - --default-authentication-plugin=caching_sha2_password
       - --innodb-buffer-pool-size=256M
@@ -278,3 +287,6 @@ services:
         condition: service_healthy
       otel-collector:
         condition: service_started
+
+volumes:
+  mysql-data:

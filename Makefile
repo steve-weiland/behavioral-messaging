@@ -10,7 +10,7 @@ BM133_WS       ?= 6
 BM133_TOTAL    ?= 12
 BM133_DURATION ?= 30
 
-.PHONY: help up down logs ps rebuild test rules-test fmt vet seed seed-people seed-segments seed-campaign showcase \
+.PHONY: help up stop down logs ps rebuild test rules-test fmt vet seed seed-people seed-segments seed-campaign showcase \
 	load load-prep load-quick load-soak seed-journey journey-runs \
 	dlq-inspect dlq-replay dlq-purge retry-queues noisy-prep noisy-neighbour bm133 \
 	mysql events-count people-count segments-count campaigns-count enrollments-count
@@ -21,7 +21,10 @@ help:
 up: ## Bring the V1 stack up (compose build + up -d)
 	$(COMPOSE) up -d --build
 
-down: ## Tear it all down (containers + volumes)
+stop: ## Stop the stack, KEEP volumes (MySQL data survives the next `make up`)
+	$(COMPOSE) down --remove-orphans
+
+down: ## Tear it all down — containers AND volumes (MySQL data included)
 	$(COMPOSE) down --volumes --remove-orphans
 
 logs: ## Tail logs from app services only

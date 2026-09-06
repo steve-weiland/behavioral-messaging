@@ -51,7 +51,8 @@ make load-quick    # 10s burst @ concurrency=5 — sanity-check the driver
 make test          # go test ./...
 make fmt vet       # gofmt + go vet
 make mysql         # interactive mysql shell
-make down          # tear it all down (compose down --volumes --remove-orphans)
+make stop          # stop the stack, keep volumes (MySQL data survives)
+make down          # tear it all down, volumes included
 ```
 
 Every tuning knob is a host env var, so the A/B runs behind the measurements
