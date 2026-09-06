@@ -49,6 +49,7 @@ make dlq-replay    # V3-2: drain the DLQ back onto the work exchange
 make load          # the ceiling-search run (= load-soak: 60s @ concurrency=20)
 make load-quick    # 10s burst @ concurrency=5 — sanity-check the driver
 make test          # go test ./...
+make smoke         # end-to-end gate over the running stack (7 checks)
 make fmt vet       # gofmt + go vet
 make mysql         # interactive mysql shell
 make stop          # stop the stack, keep volumes (MySQL data survives)
