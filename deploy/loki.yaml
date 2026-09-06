@@ -40,6 +40,3 @@ compactor:
   working_directory: /loki/compactor
   retention_enabled: true
   delete_request_store: filesystem
-
-ruler:
-  alertmanager_url: http://localhost:9093

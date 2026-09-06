@@ -104,8 +104,9 @@ func main() {
 	srv := newServer(db, publisher)
 
 	// V2-2: the people.changes feed keeps segment-worker's bitmap index
-	// current. Its own dedicated channel (amqp091 channels are
-	// single-goroutine; the campaign Publisher owns amqpCh). And /check
+	// current. Its own dedicated channel — the campaign Publisher owns
+	// amqpCh, and one writer per channel keeps failure domains and
+	// back-pressure separable (amqp091 itself is concurrency-safe). /check
 	// delegates membership to segment-worker when SEGMENT_INDEX_URL is set.
 	peopleCh, err := amqpConn.Channel()
 	if err != nil {

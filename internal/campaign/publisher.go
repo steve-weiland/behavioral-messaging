@@ -27,9 +27,11 @@ import (
 // on the broker (BM-89). The single publish worker drains the chan and
 // calls amqpx.Publish with the workspace_id as routing key.
 //
-// One amqp.Channel is used for publishing — amqp091's channels are
-// documented as single-goroutine. Sharing one channel across the
-// publisher means we have one publish worker; that's plenty of headroom
+// One amqp.Channel with a single publish worker as its only writer.
+// (amqp091 serializes channel operations internally, so this is a design
+// convention, not a thread-safety requirement — and a channel is a shared
+// failure domain either way; see amqpx.ExitOnClose.) One worker is
+// plenty of headroom
 // over V1's measured ~196 events/s fan-out ceiling (publish is far
 // cheaper than the full process() body it replaces). If a future load
 // test names this single channel as the bottleneck, V2-stretch adds
@@ -37,10 +39,12 @@ import (
 //
 // On publish failure the worker retries up to 3× with linear backoff.
 // After exhaustion the event is dropped + counted on the
-// `campaign_publish_dropped_total{workspace_id,reason}` counter. V2-3
-// closes the at-least-once gap with an outbox + idempotency keys; for
-// now this is acceptable best-effort given that "RabbitMQ is unreachable
-// for > a second" is operationally noisy enough to alert on directly.
+// `campaign_publish_dropped_total{workspace_id,reason}` counter. The
+// producer edge is deliberately best-effort and COUNTED — an outbox was
+// once slated for V2-3, which shipped enrollment idempotency instead
+// (spec: BM-100 vs the deferred BM-105); it remains future work, and
+// "RabbitMQ is unreachable for > a second" is operationally noisy
+// enough to alert on directly.
 type Publisher struct {
 	amqpCh *amqp.Channel
 	ch     chan publishJob

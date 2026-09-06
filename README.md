@@ -38,7 +38,7 @@ Multi-tenancy is **not** a tier — it's a cross-cutting V1 property
 ## Run it
 
 ```bash
-make up            # docker compose up -d --build (12 services)
+make up            # docker compose up -d --build (13 services)
 make showcase      # every surface end-to-end: people → segment → campaign → events
 make seed          # POST 10 events at 1 req/s
 make seed-campaign # define welcome_pro + 2 people + fire signed_up — end-to-end smoke

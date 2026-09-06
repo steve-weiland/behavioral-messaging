@@ -1,20 +1,16 @@
-# V2 OpenTelemetry Collector config (last touched PR 6).
+# OpenTelemetry Collector config (lifted from the Build 5
+# observability-stack sibling; the tail-sampling and exemplar rationale
+# is written up there).
 #
 # Two pipelines:
 #   traces:  OTLP/gRPC → tail_sampling → batch → OTLP/gRPC to Tempo
-#   metrics: OTLP/gRPC → batch → Prometheus exporter on :8889 (Prom scrapes)
+#   metrics: OTLP/gRPC + mysql + host_metrics → batch → Prometheus :8889
 #
-# tail_sampling (PR 6 / OBS-150/151): three-policy stack — keep all
-# errors, keep all traces > 500 ms, keep 25% of everything else. The
-# policies OR together (a trace matching any single policy is kept).
-# Services keep head-sampling at AlwaysOn (OBS-152) so the collector
-# sees every span; tail sampling decides which whole traces ship to Tempo.
-#
-# Baseline was 5% in V2; V3 PR 9 bumped it to 25% so exemplar dots on
-# the histogram dashboard panels click-through reliably. Pure 5% drop
-# rate means most fast-bucket exemplar trace_ids resolve to "not found"
-# in Tempo. 25% retains 75% of the volume savings while making the
-# UX work — see README "Exemplars vs tail sampling".
+# tail_sampling: three-policy stack — keep all errors, keep all traces
+# > 500 ms, keep 25% of everything else. The policies OR together. The
+# 25% baseline (up from 5%) is what makes exemplar dots on the histogram
+# panels resolve in Tempo; errors and slow traces are always kept.
+# Services head-sample at AlwaysOn so the collector sees every span.
 receivers:
   otlp:
     protocols:

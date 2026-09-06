@@ -25,13 +25,13 @@ down: ## Tear it all down (containers + volumes)
 	$(COMPOSE) down --volumes --remove-orphans
 
 logs: ## Tail logs from app services only
-	$(COMPOSE) logs -f track-api stub-receiver
+	$(COMPOSE) logs -f track-api stub-receiver campaign-worker journey-scheduler segment-worker
 
 ps: ## List running services
 	$(COMPOSE) ps
 
 rebuild: ## Rebuild + restart Go services only
-	$(COMPOSE) up -d --build track-api stub-receiver
+	$(COMPOSE) up -d --build track-api stub-receiver campaign-worker journey-scheduler segment-worker
 
 test: ## Run all Go unit tests (no docker required)
 	go test ./...
